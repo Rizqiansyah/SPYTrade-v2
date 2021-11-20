@@ -4,6 +4,8 @@ author: "Akbar Rizqiansyah"
 date: "06/11/2021"
 output: html_document
 ---
+bla bla bla
+
 
 Objective:
 Do proper out of sample forecasting (5 days), see how the model performs along the 5 days.
