@@ -1,0 +1,214 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyquant)
+library(tidyverse)
+library(ggplot2)
+library(e1071)
+library(lubridate)
+library(SharpeR)
+library(PortfolioAnalytics)
+library(tbl2xts)
+library(ROI)
+library(plotly)
+library(naniar)
+library(broom)
+library(quantmod)
+library(rugarch)
+library(rmgarch)
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+ticker <- read_csv("data/SPYticker.csv")
+
+start = '2017-01-01'
+
+```
+
+```{r}
+spy <- tq_get("SPY",
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+all_stock <- tq_get(ticker,
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r}
+write_csv(all_stock, "data/df0.csv")
+```
+
+```{r}
+all_stock <- read_csv("data/df0.csv")
+```
+
+```{r}
+#Subset data into training and verification
+#verification data from today - 365 days
+
+spy_train <- spy %>% filter(date < today()-days(365))
+all_stock_train <- all_stock %>% filter(date<today()-days(365))
+
+spy_verify <- spy %>% filter(date >= today()-days(365))
+all_stock_verify <- all_stock %>% filter(date >= today()-days(365))
+
+```
+
+
+
+```{r}
+spy1 <- spy_train %>%
+  select("date", "symbol", "close") %>%
+  mutate(r1 = log(close/lag(close, n=1))) %>%
+  filter(date > ymd(start) + days(2))
+
+df1 <- all_stock_train %>%
+  select("date", "symbol", "close") %>%
+  mutate(r1 = log(close/lag(close, n=1))) %>%
+  filter(date > ymd(start) + days(2))
+```
+
+
+```{r}
+p_df1 <- ggplot(df1,
+       aes(x= date,
+           y= r1,
+           group_by= symbol)) + 
+  geom_line()
+
+#ggplotly(p_df1)
+p_df1
+
+ggplot(df1)+
+  geom_histogram(aes(x= r1, group_by= symbol))
+```
+
+```{r}
+xts1 <- tbl_xts(filter(df1, date > ymd(start) + days(2)), 
+                cols_to_xts = r1, 
+                spread_by= symbol)
+```
+
+#Model AAPL
+```{r}
+aapl <- xts1$AAPL
+
+p = c(1:10)
+q = c(1:10)
+gp = c(1:1)
+gq = c(1:1)
+
+
+ARMA_tbl <- tibble(p = c(0),
+                  q = c(0),
+                  gp = c(0),
+                  gq = c(0),
+                  AIC = c(0),
+                  BIC = c(0))
+for (i in p){
+  print("i=")
+  print(i)
+  for (j in q){
+    print(j)
+    for (m in gp){
+      for (n in gq){
+        ug_spec <- ugarchspec(mean.model = list(armaOrder = c(i, j)),
+                      variance.model = list(model = "iGARCH", 
+                                            garchOrder = c(m,n)))
+        ugfit <- ugarchfit(spec = ug_spec, data = aapl)
+        
+        AIC <- infocriteria(ugfit)[1]
+        BIC <- infocriteria(ugfit)[2]
+        result <- tibble(p = i, q = j, gp = m, gq = n, AIC = AIC, BIC = BIC)
+        ARMA_tbl <- bind_rows(ARMA_tbl, result)
+      }
+    }
+  }
+}
+```
+
+```{r}
+bestARMA <- ARMA_tbl %>% top_n(1, -AIC)
+p = bestARMA$p
+q = bestARMA$q
+gp = c(1:10)
+gq = c(1:10)
+
+
+GARCH_tbl <- tibble(p = c(0),
+                  q = c(0),
+                  gp = c(0),
+                  gq = c(0),
+                  AIC = c(0),
+                  BIC = c(0))
+for (i in p){
+  for (j in q){
+    for (m in gp){
+      print("m=")
+      print(m)
+      for (n in gq){
+        print(n)
+        ug_spec <- ugarchspec(mean.model = list(armaOrder = c(i, j)),
+                      variance.model = list(model = "iGARCH", 
+                                            garchOrder = c(m,n)))
+        ugfit <- ugarchfit(spec = ug_spec, data = aapl)
+        
+        AIC <- infocriteria(ugfit)[1]
+        BIC <- infocriteria(ugfit)[2]
+        result <- tibble(p = i, q = j, gp = m, gq = n, AIC = AIC, BIC = BIC)
+        GARCH_tbl <- bind_rows(GARCH_tbl, result)
+      }
+    }
+  }
+}
+```
+
+```{r}
+bestGARCH <- GARCH_tbl %>% top_n(1,-AIC)
+i = bestGARCH$p
+j = bestGARCH$q
+m = bestGARCH$gp
+n = bestGARCH$gq
+
+
+ug_spec <- ugarchspec(mean.model = list(armaOrder = c(i, j)),
+                      variance.model = list(model = "iGARCH", 
+                                            garchOrder = c(m,n)))
+ugfit <- ugarchfit(spec = ug_spec, data = aapl)
+```
+
+
+```{r}
+fitted_aapl <- tibble(fitted = ugfit@fit$fitted.values)
+resid_aapl <- tibble(resid = ugfit@fit$residuals)
+
+fitted_aapl <- df1 %>% filter(symbol == "AAPL") %>%
+  select(date, r1) %>%
+  bind_cols(fitted_aapl, resid_aapl) %>%
+  pivot_longer(cols = c(r1, fitted),
+               names_to = "type",
+               values_to = "value")
+
+ggplot(fitted_aapl) +
+  geom_line(aes(x=date,
+                y=value,
+                color=type))
+
+ggplot(fitted_aapl) +
+  geom_line(aes(x=date,
+                y=resid))
+```

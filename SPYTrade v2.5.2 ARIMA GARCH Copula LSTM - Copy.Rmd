@@ -1,0 +1,948 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+Objective of this document:
+1. To explore the best ARIMA-GARCH-Copula (AGC) model for AMZN and MSFT
+Difference to v2.5.1
+1. No portfolio Analysis
+2. Commented out the ARIMA-GARCH model search. The best fit model is loaded from storage instead
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+EVAL_GARCH_OPTION = FALSE
+```
+
+```{r}
+library(quantmod)
+library(lattice)
+library(timeSeries)
+library(rugarch)
+library(xts)
+library(tidyverse)
+library(tidyquant)
+```
+
+```{r, warning = FALSE, echo = FALSE}
+#Download data
+ticker = c("AMZN",
+          "MSFT")
+all_stock <- tq_get(ticker,
+              from = "2020-01-01",
+              to = "2021-11-16",
+              get = "stock.prices") %>%
+  select(symbol, date, close) %>%
+  mutate(lret = c(0, diff(log(close))))
+
+#Turn all first days returns to 0
+first_day <- all_stock %>%
+  group_by(symbol) %>%
+  summarise(date = min(date)) %>%
+  left_join(all_stock, by = c("symbol" = "symbol", "date" = "date")) %>%
+  mutate(lret = 0)
+
+all_stock <- all_stock %>% 
+  anti_join(first_day, by = c("symbol" = "symbol", "date" = "date")) %>%
+  bind_rows(first_day) %>%
+  arrange(date) 
+
+#Remove N_VERIFICATION amount of observations for verification later
+N_VERIFICATION = 14
+all_stock_train <- all_stock %>% 
+  filter(date < max(date) - days(N_VERIFICATION))
+```
+
+
+```{r}
+#Find best fit ARIMA and GARCH (Asymmetric) specification for all stocks
+best_fit <- tibble(symbol = ticker,
+               ARIMA_AIC = Inf,
+               GARCH_AIC = Inf,
+               ARIMA_p = 1,
+               ARIMA_d = 0,
+               ARIMA_q = 1,
+               GARCH_p = 1,
+               GARCH_q = 1,
+               spec = list(0),
+               final_fit = list(0)) %>%
+  nest(order = c(ARIMA_p, ARIMA_d, ARIMA_q, GARCH_p, GARCH_q))
+```
+
+
+# Find best ARIMA-GARCH model based on AIC
+Note 16/11/2021 - 
+Sometimes ugarchfit() fails to converge (example is AAPL data) for the best ARIMA lags, but converges for lower ARIMA lags. Maybe need to temporarily store the AIC of all ARIMA model, and walk backward the ARIMA model from best to worse AIC if GARCH fails to converge
+
+
+```{r, eval = EVAL_GARCH_OPTION}
+# #Settings
+# MAX_ARIMA_P = 5
+# MAX_ARIMA_Q = 5
+# MAX_GARCH_P = 5
+# MAX_GARCH_Q = 5
+# 
+# for (i in c(1:length(ticker))) {
+#   #Temporary variables
+#   current.symbol <- ticker[i]
+#   df <- all_stock_train %>% 
+#     filter(symbol == current.symbol)
+#   df <- df$lret
+#   final.aic <- best_fit$ARIMA_AIC[i]
+#   final.order = c(0, 0, 0)
+#   
+#   for (p in 0:MAX_ARIMA_P) for (q in 0:MAX_ARIMA_Q) {
+#     if ( p == 0 && q == 0) {
+#       next
+#     }
+#     
+#     arimaFit = tryCatch( arima(df, order=c(p, 0, q)),
+#                          error=function( err ) {
+#                            message(err)
+#                            return(FALSE)
+#                          },
+#                          warning=function( err ) {
+#                            # message(err)
+#                            return(FALSE)
+#                          } )
+#     
+#     if( !is.logical( arimaFit ) ) {
+#       current.aic <- AIC(arimaFit)
+#       if (current.aic < final.aic) {
+#         final.aic <- current.aic
+#         final.order <- c(p, 0, q)
+#         # final.arima <- arima(df, order=final.order)
+#         final.arima <- arimaFit
+#       }
+#     } else {
+#       next
+#     }
+#   }
+# 
+#   # test for the case we have not achieved a solution  
+#   if (final.order[1]==0 && final.order[3]==0) {
+#     final.order[1] = 1
+#     final.order[3] = 1
+#   }
+#   #Store the ARIMA results
+#   best_fit$order[[i]]$ARIMA_p = final.order[1]
+#   best_fit$order[[i]]$ARIMA_d = final.order[2]
+#   best_fit$order[[i]]$ARIMA_q = final.order[3]
+#   
+#   # Specify and fit the GARCH model
+#   #Temporary variables
+#   final.aic <- best_fit$GARCH_AIC[i]
+#   final.garchOrder <- c(0,0)
+#   for (p in 1:MAX_GARCH_P) for (q in 1:MAX_GARCH_Q) {
+#     print(paste("Stock =", current.symbol, "p =", p, "q =", q))
+#     spec = ugarchspec(
+#       variance.model=list(model ="eGARCH",
+#                           #submodel = "TGARCH",
+#                           garchOrder=c(p,q)),
+#       mean.model=list(armaOrder=c(final.order[1], 
+#                                   final.order[3]), 
+#                                   include.mean=T),
+#       distribution.model="sged"
+#     )
+#     garchFit = tryCatch(
+#       ugarchfit(
+#         spec, df, solver = 'hybrid'
+#       ), 
+#       error=function( err ) {
+#                            message(err)
+#                            return(FALSE)
+#                          },
+#       warning=function( err ) {
+#                            #message(err)
+#                            return(FALSE)
+#                          } )
+#     
+#     if( !is.logical( garchFit ) ) {
+#       current.aic <- infocriteria(garchFit)[1]
+#       if (current.aic < final.aic) {
+#         final.aic <- current.aic
+#         final.garchOrder <- c(p, q)
+#         final.garch.spec <- spec
+#         final.garch.fit <- garchFit
+#       }
+#     } else {
+#       next
+#     }
+#   }
+#   #Store the GARCH results
+#   best_fit$spec[[i]] = final.garch.spec
+#   best_fit$final_fit[[i]] = final.garch.fit
+#   best_fit$order[[i]]$GARCH_p = final.garchOrder[1]
+#   best_fit$order[[i]]$GARCH_q = final.garchOrder[2]
+# }
+# saveRDS(best_fit, "data/best_fit.rds")
+```
+Load
+```{r}
+best_fit <- readRDS("data/best_fit.rds")
+```
+
+```{r}
+#Construct the uGARCHfit and uGARCHspec objects
+# best_fit$spec <- map(best_fit$order, function(order){
+#   ARIMA_p = order$ARIMA_p
+#   ARIMA_d = order$ARIMA_d
+#   ARIMA_q = order$ARIMA_q
+#   GARCH_p = order$GARCH_p
+#   GARCH_q = order$GARCH_q
+#   
+#   result <- ugarchspec(
+#     variance.model=list(model ="eGARCH",
+#                         #submodel = "TGARCH",
+#                         garchOrder=c(GARCH_p, GARCH_q)),
+#     mean.model=list(armaOrder=c(ARIMA_p, 
+#                                 ARIMA_q), 
+#                     include.mean=T),
+#     distribution.model="sged"
+#   )
+#   return(result)
+# })
+# 
+# best_fit$final_fit <- map(best_fit$spec, )
+```
+
+```{r}
+df_resid <- tibble(date = index(residuals(best_fit$final_fit[[1]])),
+                       AMZN = coredata(residuals(best_fit$final_fit[[1]]))) %>%
+  full_join(tibble(date = index(residuals(best_fit$final_fit[[2]])),
+                   MSFT = coredata(residuals(best_fit$final_fit[[2]]))),
+            by = "date")
+
+ggplot(df_resid) +
+  geom_line(aes(x = date,
+                y = AMZN,
+                color = "AMZN")) +
+  geom_line(aes(x = date,
+                y = MSFT,
+                color = "MSFT")) +
+  ggtitle("Residuals (Not Standardised)")
+```
+
+```{r}
+df_std_resid <- tibble(date = index(residuals(best_fit$final_fit[[1]], 
+                                              standardize = T)),
+                       AMZN = coredata(residuals(best_fit$final_fit[[1]], 
+                                              standardize = T))) %>%
+  full_join(tibble(date = index(residuals(best_fit$final_fit[[2]], 
+                                              standardize = T)),
+                   MSFT = coredata(residuals(best_fit$final_fit[[2]], 
+                                              standardize = T))),
+            by = "date")
+
+ggplot(df_std_resid) +
+  geom_line(aes(x = date,
+                y = AMZN,
+                color = "AMZN")) +
+  geom_line(aes(x = date,
+                y = MSFT,
+                color = "MSFT")) +
+  ggtitle("Standardised Residuals")
+
+ggplot(df_std_resid,
+       aes(x = AMZN,
+           y = MSFT)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  ggtitle("Scatter plot of standardised residuals. Note the non normal behaviour of the two") +
+  xlab("AMZN") +
+  ylab("MSFT")
+```
+
+```{r}
+#Check the distribution of AMZN and MSFT
+#against normal and SGED distributions
+library(fGarch)
+
+df_fitted_std_resid <- df_std_resid %>%
+  mutate(norm.AMZN = dnorm(AMZN, 
+                           mean = mean(AMZN),
+                           sd = sd(AMZN))) %>%
+  mutate(sged.AMZN = dsged(AMZN,
+                           mean = mean(AMZN),
+                           sd = sd(AMZN),
+                           nu = coef(best_fit$final_fit[[1]])["shape"],
+                           xi = coef(best_fit$final_fit[[1]])["skew"])) %>%
+  mutate(norm.MSFT = dnorm(MSFT, 
+                           mean = mean(MSFT),
+                           sd = sd(MSFT))) %>%
+  mutate(sged.MSFT = dsged(MSFT,
+                           mean = mean(MSFT),
+                           sd = sd(MSFT),
+                           nu = coef(best_fit$final_fit[[2]])["shape"],
+                           xi = coef(best_fit$final_fit[[2]])["skew"]))
+ggplot(df_fitted_std_resid) +
+  geom_density(aes(x=AMZN)) +
+  geom_point(aes(x=AMZN, y=norm.AMZN, color="Normal")) +
+  geom_point(aes(x=AMZN, y=sged.AMZN, color="SGED"))+
+  ggtitle("AMZN standardised residuals density")
+
+ggplot(df_fitted_std_resid) +
+  geom_density(aes(x=MSFT)) +
+  geom_point(aes(x=MSFT, y=norm.MSFT, color="Normal")) +
+  geom_point(aes(x=MSFT, y=sged.MSFT, color="SGED"))+
+  ggtitle("MSFT standardised residuals density")
+
+```
+Seems like AMZN fits SGED better while MSFT fits normal better. Check if we map to the CDF, we get somewhat close to a uniform distribution
+
+```{r}
+#Transform the standardised residuals into CDF of Skewed Generalised Error Distribution (SGED) and/or normal
+
+df_cdf_std_resid <- df_std_resid %>%
+  mutate(AMZN_CDF = psged(AMZN,
+                           mean = mean(AMZN),
+                           sd = sd(AMZN),
+                           nu = coef(best_fit$final_fit[[1]])["shape"],
+                           xi = coef(best_fit$final_fit[[1]])["skew"])) %>%
+  mutate(MSFT_CDF = pnorm(MSFT,
+                           mean = mean(MSFT),
+                           sd = sd(MSFT)))
+ggplot(df_cdf_std_resid)+
+  geom_histogram(aes(x=AMZN_CDF, fill="AMZN"))+
+  ggtitle("Density of standardised residual CDF")
+ggplot(df_cdf_std_resid)+
+  geom_histogram(aes(x=MSFT_CDF, fill="MSFT"))+
+  ggtitle("Density of standardised residual CDF")
+```
+
+Plot the two in a scatter plot
+```{r}
+ggplot(df_cdf_std_resid,
+       aes(x = AMZN_CDF,
+           y = MSFT_CDF)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+Check the correlation between the two stocks and their CDF
+```{r}
+library(psych)
+#NOTE all are residuals of the ARIMA-GARCH model
+pairs.panels(df_cdf_std_resid %>% select(AMZN_CDF, MSFT_CDF))
+pairs.panels(df_cdf_std_resid %>% select(AMZN, MSFT))
+```
+
+Fit a Copula to the stocks
+Restrict to independent, gaussian and t copula
+Note 16/11/2021 - Study other kinds of copula. When unrestricted, the function tries to fit a "survival BB8" copula. Not sure what that is.
+```{r}
+library(VineCopula)
+u1 <- df_cdf_std_resid$AMZN_CDF
+u2 <- df_cdf_std_resid$MSFT_CDF
+selectedCopula <- BiCopSelect(u1 = u1, u2 = u2, familyset = c(0:2))
+selectedCopula
+```
+
+Fit it using copula library, should give the same result as the above
+```{r}
+library(copula)
+t.cop <- tCopula(dim=2)
+fit <- fitCopula(t.cop,cbind(u1,u2),method='ml')
+coef(fit)
+```
+
+Create n random samples from the copula, see if they look similar to the AMZN and MSFT data we had
+
+```{r}
+n = 100000
+param1 = coef(fit)["rho.1"]
+param2 = coef(fit)["df"]
+set.seed(1)
+uRandom <- rCopula(n, tCopula(c(param1), dim =2, df= param2))
+
+#Construct a df, and plot
+df_copula <- df_cdf_std_resid %>% 
+  select(AMZN_CDF, MSFT_CDF) %>%
+  mutate(label = "actual") %>%
+  bind_rows(tibble(AMZN_CDF = uRandom[,1],
+                   MSFT_CDF = uRandom[,2],
+                   label = "random generation"))
+
+ggplot(df_copula)+
+  geom_point(aes(x=AMZN_CDF,
+                 y=MSFT_CDF,
+                 color = label)) +
+  ggtitle("Randomly Generated t-Copula")
+
+```
+
+Use the randomly generated CDF returns from the Copula and compare it with the actual return
+```{r}
+mean = mean(df_std_resid$AMZN)
+sd = sd(df_std_resid$AMZN)
+nu = coef(best_fit$final_fit[[1]])["shape"]
+xi = coef(best_fit$final_fit[[1]])["skew"]
+
+df_copula <- df_copula %>%
+  mutate(AMZN_RAND_RESID = qsged(AMZN_CDF,
+                                 mean = mean,
+                                 sd = sd,
+                                 nu = nu,
+                                 xi = xi))
+
+mean = mean(df_std_resid$MSFT)
+sd = sd(df_std_resid$MSFT)
+
+df_copula <- df_copula %>%
+  mutate(MSFT_RAND_RESID = qnorm(MSFT_CDF,
+                                 mean = mean,
+                                 sd = sd))
+
+#Plus calcualte the copula (joint probability)
+param1 = coef(fit)["rho.1"]
+param2 = coef(fit)["df"]
+
+joint_prob <- dCopula(array(c(df_copula$AMZN_CDF, df_copula$MSFT_CDF), 
+                            dim = c(length(df_copula$AMZN_CDF), 2)), 
+                      tCopula(c(param1), dim =2, df= param2))
+
+df_copula <- df_copula %>%
+  bind_cols(joint_prob = joint_prob)
+
+
+ggplot(df_copula) +
+  geom_density(aes(x=AMZN_RAND_RESID, color = label)) +
+  ggtitle("AMZN actual vs randomly generated standardised residuals")
+
+ggplot(df_copula) +
+  geom_density(aes(x=MSFT_RAND_RESID, color = label)) +
+  ggtitle("MSFT actual vs randomly generated standardised residuals")
+```
+Use the randomly generated standardised residuals to construct a 5% VaR of a portfolio of 50% AMZN and 50% MSFT.
+
+Steps:
+1. Using the randomly generated residuals, calculate the 1 step estimate, i.e.
+
+$$ X_{t} = ARIMA + e_t$$
+$$ e_t = \sigma_t * u_t$$
+u_t is the randomly generated standardised residuals
+$$ \sigma_t^2 = GARCH$$
+
+
+
+```{r}
+#Get the standardised residuals which were randomly generated before
+df_VaR_std_resid <- df_copula %>% filter(label=="random generation") %>%
+  select(AMZN_RAND_RESID, MSFT_RAND_RESID) %>%
+  rename(AMZN_std_resid = AMZN_RAND_RESID) %>%
+  rename(MSFT_std_resid = MSFT_RAND_RESID)
+
+#Calculate the residuals = sigma * standardised residuals
+df_VaR <- tibble(date = index(sigma(best_fit$final_fit[[1]])),
+                 AMZN_sigma = sigma(best_fit$final_fit[[1]])) %>%
+  full_join(tibble(date = index(sigma(best_fit$final_fit[[2]])),
+                   MSFT_sigma = sigma(best_fit$final_fit[[2]])),
+            by = "date")
+df_VaR <- df_VaR %>%
+  bind_cols("AMZN_resid" = coredata(df_VaR$AMZN_sigma) %*% t(df_VaR_std_resid$AMZN_std_resid))%>%
+  bind_cols("MSFT_resid" = coredata(df_VaR$MSFT_sigma) %*% t(df_VaR_std_resid$MSFT_std_resid))
+
+#Plot one of the realisation
+plot(density(df_VaR$AMZN_resid[1,]))
+
+#Calculate the 5% VaR
+temp <- matrix(0, nrow = nrow(df_VaR), ncol = 2)
+for (i in 1:nrow(df_VaR)){
+  temp[i,1] <- quantile(df_VaR$AMZN_resid[i,], prob = 0.05)
+  temp[i,2] <- quantile(df_VaR$MSFT_resid[i,], prob = 0.05)
+}
+
+df_VaR <- df_VaR %>%
+  bind_cols(AMZN_VaR = temp[,1]) %>%
+  bind_cols(MSFT_VaR = temp[,2])
+
+#Combine the fitted value with the VaR
+df_VaR <- df_VaR %>%
+  bind_cols(AMZN_fitted = fitted(best_fit$final_fit[[1]])) %>%
+  bind_cols(MSFT_fitted = fitted(best_fit$final_fit[[2]])) %>%
+  mutate(AMZN_VaR = AMZN_fitted + AMZN_VaR) %>%
+  mutate(MSFT_VaR = MSFT_fitted + MSFT_VaR) 
+
+#Combine with the actual return data
+df_VaR <- df_VaR %>%
+  bind_cols(all_stock_train %>% 
+              filter(symbol == "AMZN") %>%
+              select(lret) %>%
+              rename(AMZN_actual = lret)) %>%
+  bind_cols(all_stock_train %>% 
+              filter(symbol == "MSFT") %>%
+              select(lret) %>%
+              rename(MSFT_actual = lret))
+
+#Plot each stock with its actual and VaR
+ggplot(df_VaR)+
+  geom_line(aes(x= date, y=AMZN_actual, color= "actual")) +
+  geom_line(aes(x= date, y=AMZN_fitted, color= "fitted")) +
+  geom_line(aes(x= date, y=AMZN_VaR, color= "5% VaR")) +
+  ggtitle("AMZN Return and 5% VaR")
+
+ggplot(df_VaR)+
+  geom_line(aes(x= date, y=MSFT_actual, color= "actual")) +
+  geom_line(aes(x= date, y=MSFT_fitted, color= "fitted")) +
+  geom_line(aes(x= date, y=MSFT_VaR, color= "5% VaR")) +
+  ggtitle("MSFT Return and 5% VaR")
+
+#Calculate number of exceedance of 5% VaR
+
+df_VaR %>% 
+  mutate(AMZN_exceed = AMZN_actual<AMZN_VaR) %>%
+  mutate(MSFT_exceed = MSFT_actual<MSFT_VaR) %>%
+  select(AMZN_exceed, MSFT_exceed) %>%
+  pivot_longer(cols = c(AMZN_exceed, MSFT_exceed),
+               names_to = "symbol",
+               values_to = "exceed") %>%
+  group_by(symbol) %>%
+  summarise(exceed_num = sum(exceed),
+            exceed_prop = sum(exceed)/nrow(df_VaR),
+            expected = 0.05*nrow(df_VaR))
+
+
+```
+
+Explore the CDF of the actual and fitted return
+Using the simulated return data
+Note the fitted return will always be close to 50% quantile, as by definition they are the mean
+
+```{r}
+df_return_cdf <- df_VaR %>% 
+  select(date, 
+         AMZN_resid, MSFT_resid, 
+         AMZN_fitted, MSFT_fitted, 
+         AMZN_actual, MSFT_actual)
+
+#Calculate the simulated portfolio returns
+temp_sim_AMZN <- matrix(0, 
+                    nrow = nrow(df_return_cdf$AMZN_resid), 
+                    ncol = ncol(df_return_cdf$AMZN_resid))
+temp_sim_MSFT <- matrix(0, 
+                    nrow = nrow(df_return_cdf$MSFT_resid), 
+                    ncol = ncol(df_return_cdf$MSFT_resid))
+#Calculate the CDF of the actual return
+temp_actual_AMZN <- matrix(0, 
+                    nrow = nrow(df_return_cdf$AMZN_resid), 
+                    ncol = 1)
+temp_actual_MSFT <- matrix(0, 
+                    nrow = nrow(df_return_cdf$MSFT_resid), 
+                    ncol = 1)
+#Calculate the CDF of the fitted return
+temp_fitted_AMZN <- temp_actual_AMZN
+temp_fitted_MSFT <- temp_actual_MSFT
+
+#Function to return empirical quantile (CDF) given data and the number
+equantile <- function(data, value){
+    tmp_a <- ecdf(data)
+    return(tmp_a(value))
+}
+
+#Note the performance of the loop is very poor. Need to look into the data structure and find more efficient ways of doing this
+
+for (i in 1:nrow(df_return_cdf)){
+  #Calculate the simulated portfolio returns
+  temp_sim_AMZN[i,] <- df_return_cdf$AMZN_resid[i,] + rep(df_return_cdf$AMZN_fitted[i], times = ncol(temp_sim_AMZN))
+  temp_sim_MSFT[i,] <- df_return_cdf$MSFT_resid[i,] + rep(df_return_cdf$MSFT_fitted[i], times = ncol(temp_sim_AMZN))
+  
+  #Calculate the CDF of the actual return
+  temp_actual_AMZN[i] <- equantile(temp_sim_AMZN[i,],
+                                   df_return_cdf$AMZN_actual[i])
+  temp_actual_MSFT[i] <- equantile(temp_sim_MSFT[i,],
+                                df_return_cdf$MSFT_actual[i])
+  
+  #Calculate the CDF of the fitted return
+  temp_fitted_AMZN[i] <- equantile(temp_sim_AMZN[i,],
+                                df_return_cdf$AMZN_fitted[i])
+  temp_fitted_MSFT[i] <- equantile(temp_sim_MSFT[i,],
+                                df_return_cdf$MSFT_fitted[i])
+}
+
+df_return_cdf <- df_return_cdf %>%
+  bind_cols("AMZN_simulated_return" = temp_sim_AMZN) %>%
+  bind_cols("MSFT_simulated_return" = temp_sim_MSFT) %>%
+  bind_cols("AMZN_actual_quantile" = temp_actual_AMZN) %>%
+  bind_cols("MSFT_actual_quantile" = temp_actual_MSFT) %>%
+  bind_cols("AMZN_fitted_quantile" = temp_fitted_AMZN) %>%
+  bind_cols("MSFT_fitted_quantile" = temp_fitted_MSFT)
+
+rm(temp_sim_AMZN, temp_sim_MSFT, 
+   temp_actual_AMZN, temp_actual_MSFT,
+   temp_fitted_AMZN, temp_fitted_MSFT)
+```
+
+Plot the CDF
+```{r}
+#Plot the results
+plot_return_cdf <- ggplot(df_return_cdf) +
+  geom_line(aes(x=date,
+                 y=AMZN_actual_quantile,
+                 color = "AMZN"))+
+  geom_line(aes(x=date,
+                 y=MSFT_actual_quantile,
+                 color = "MSFT"))+
+  geom_line(aes(x=date,
+                 y=AMZN_fitted_quantile,
+                 color = "AMZN fitted"))+
+  geom_line(aes(x=date,
+                 y=MSFT_fitted_quantile,
+                 color = "MSFT fitted")) +
+  geom_hline(aes(color = "5% VaR"),yintercept = 0.05)
+  ggtitle("AMZN, MSFT actual and fitted return quantile based on empirical CDF of 100,000 randomly generated date from ARIMA-eGARCH-tCopula model")
+
+ggplot(df_return_cdf)+
+  stat_ecdf(aes(x= AMZN_actual_quantile,
+                color = "AMZN"), 
+            geom="line") +
+  stat_ecdf(aes(x= MSFT_actual_quantile,
+                color = "MSFT"), 
+            geom="line") +
+  geom_abline(aes(color = "Theoretical"),slope = 1, intercept = 0) +
+  ggtitle("CDF distribution of AMZN, MSFT. 45 degree line indicates theoretical value")
+  
+library(plotly)
+ggplotly(plot_return_cdf)
+```
+
+#LSTM TIME!
+The idea is to fit the quantile (empirical cdf) of the actual return as produced by the ARIMA-eGARCH-tCopula model as the input for the LSTM model.
+
+Note that the ARIMA-eGARCH-tCopula model is our prior model
+
+The LSTM model will then (hopefully) create a better prediction for this ecdf then the simple ARIMA model (Which is now just a straight line as by definition this is the ecdf!)
+
+The output of the LSTM model will then be inverted using the inverse ecdf from the prior model
+
+Then replot the fitted return based on the LSTM model, see if it is better then the ARIMA model for return we had.
+
+Then do residuals analysis:
+1. Calculate the residuals on each time step.
+1. Fit a new eGARCH (or other GARCH variation) based on this new residuals.
+1. See if the standardised residual is well behaving. If it is,
+1. Fit a new tCopula (or other copula) for the two stocks.
+1. Create random sample from the fitted copuala.
+1. Calculate the sigma of these random samples.
+1. Calculate 5% VaR from these random sigma samples.
+1. See if this new VaR is better then the previous VaR.
+1. Do portfolio analysis, see how VaR is impacted based on weight, composition, etc.
+1. Compare overall performance of the new prior-LSTM model against the prior.
+
+If this is all good, then maybe worth exploring re-feeding the new ecdf to another LSTM (or other NN) model
+
+
+First, test for stationarity
+Note that stationarity is not strictly required for LSTM model. But it should help the model in training and (maybe more?)
+```{r}
+#Use Augmented Dickey-Fuller Test to test for stationarity
+#H0 : Time series is non-stationary
+#H1 : Time series is stationary
+#alpha = 0.05. Reject null at alpha level.
+
+library(tseries)
+adf.test(df_return_cdf$AMZN_actual_quantile)
+adf.test(df_return_cdf$MSFT_actual_quantile)
+```
+ADF test suggests both AMZN and MSFT data is stationary.
+Create new object for easier access by the python interpreter
+```{r}
+lstm_input <- df_return_cdf %>%
+  select(date, 
+         AMZN_actual, MSFT_actual,
+         AMZN_actual_quantile, MSFT_actual_quantile) %>%
+  mutate(AMZN_actual_quantile = as.vector(AMZN_actual_quantile)) %>%
+  mutate(MSFT_actual_quantile = as.vector(MSFT_actual_quantile))
+write_csv(lstm_input, "data/lstm_input.csv")
+```
+
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from pandas import read_csv
+import pandas as pd
+import math
+import os
+
+from keras.models import Sequential
+from keras.layers import Dense, SimpleRNN, LSTM
+#Do not use MinMaxScaler. Our data is already in range [0,1]
+#from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+
+```
+
+```{python}
+#Get the dataset
+all_dataset = r.lstm_input
+
+plt.clf()
+plt.plot(all_dataset.MSFT_actual_quantile)
+plt.plot(all_dataset.AMZN_actual_quantile)
+plt.show()
+```
+
+Let's do AMZN first, then MSFT later
+```{python}
+#Convert pandas dataframe to numpy array
+#Take AMZN first
+dataset = all_dataset[["AMZN_actual_quantile"]].values
+dataset = dataset.astype('float32') #Convert values to float
+
+# split into train and test sets. 2/3 training, 1/3 test
+train_size = int(len(dataset) * 0.66)
+test_size = len(dataset) - train_size
+train, test = dataset[0:train_size,:], dataset[train_size:len(dataset),:]
+
+
+#Use TimeseriesGenerator to organize training data into the right format
+#We can use a generator instead......
+from keras.preprocessing.sequence import TimeseriesGenerator # Generates batches for sequence data
+seq_size = length =  10 
+batch_size = 1
+train_generator = TimeseriesGenerator(train,train,length=length,batch_size=batch_size)
+print("Total number of samples in the original training data = ", len(train))
+print("Total number of samples in the generated data = ", len(train_generator))
+
+# print a couple of samples... 
+x, y = train_generator[0]
+
+#Also generate validation data
+validation_generator = TimeseriesGenerator(test, test, length=length ,batch_size=batch_size)
+
+#Input dimensions are... (N x seq_size)
+num_features = 1 #Univariate example
+
+```
+
+```{python}
+#LSTM single layer with 50 units
+model = Sequential()
+
+model.add(LSTM(64, input_shape=(length, num_features)))
+model.add(Dense(32))
+model.add(Dense(1, activation="sigmoid"))
+model.compile(optimizer = 'adam', loss='mse')
+
+model.summary()
+```
+
+```{python}
+print('Training...')
+model.fit_generator(generator=train_generator, verbose=0, epochs=100, validation_data=validation_generator)
+```
+
+```{python}
+trainPredict = model.predict(train_generator)
+testPredict = model.predict(validation_generator)
+
+
+# calculate root mean squared error
+trainScore = math.sqrt(mean_squared_error(train[10:], trainPredict[:,0]))
+print('Train Score: %.2f RMSE' % (trainScore))
+
+testScore = math.sqrt(mean_squared_error(test[10:], testPredict[:,0]))
+print('Test Score: %.2f RMSE' % (testScore))
+```
+```{python}
+# shift train predictions for plotting
+#we must shift the predictions so that they align on the x-axis with the original dataset. 
+trainPredictPlot = np.empty_like(dataset)
+trainPredictPlot[:, :] = np.nan
+trainPredictPlot[length:len(trainPredict)+length, :] = trainPredict
+
+# shift test predictions for plotting
+testPredictPlot = np.empty_like(dataset)
+testPredictPlot[:, :] = np.nan
+#testPredictPlot[len(trainPredict)+(seq_size*2)-1:len(dataset)-1, :] = testPredict
+testPredictPlot[len(train)+(length)-1:len(dataset)-1, :] = testPredict
+
+
+plt.clf()
+plt.plot(dataset)
+plt.plot(trainPredictPlot)
+plt.plot(testPredictPlot)
+plt.show()
+```
+
+```{python}
+#Combine the prediction and training dataset
+lstm_output = np.empty_like(dataset)
+lstm_output[:, :] = np.nan
+lstm_output[length:len(trainPredict)+length, :] = trainPredict
+lstm_output[len(train)+(length)-1:len(dataset)-1, :] = testPredict
+
+#Write as csv
+lstm_output = pd.DataFrame(lstm_output, columns = ['predicted'])
+lstm_output.to_csv('./data/lstm_output.csv')
+
+```
+
+Obtain the LSTM output in R
+```{r}
+lstm_output <- read_csv("data/lstm_output.csv") %>%
+  select(predicted)
+
+df_lstm_results <- lstm_input %>%
+  bind_cols(lstm_output) %>%
+  rename(AMZN_lstm_predicted = predicted)
+```
+
+Invert the predicted result using the ecdf from df_return_cdf
+```{r}
+#Calculate the CDF of the fitted return
+temp_lstm_AMZN <- matrix(NA, 
+                    nrow = nrow(df_return_cdf$AMZN_resid), 
+                    ncol = 1)
+#temp_lstm_MSFT <- matrix(NA, 
+#                    nrow = nrow(df_return_cdf$MSFT_resid), 
+#                    ncol = 1)
+
+#Note the performance of the loop is very poor. Need to look into the data structure and find more efficient ways of doing this
+
+for (i in 1:nrow(df_return_cdf)){
+  #Calculate the inverse CDF of the fitted return
+  probs = df_lstm_results$AMZN_lstm_predicted[i]
+  if (!is.na(probs)){
+  temp_lstm_AMZN[i] <- quantile(df_return_cdf$AMZN_simulated_return[i,], 
+                                probs = probs)
+  }
+#  temp_lstm_MSFT[i] <- 
+}
+df_lstm_results <- df_lstm_results %>%
+  bind_cols(AMZN_lstm_fitted_return = as.vector(temp_lstm_AMZN))
+```
+
+
+Check the residuals
+```{r}
+df_lstm_residuals <- df_lstm_results %>%
+  select(AMZN_actual,
+         AMZN_lstm_fitted_return)
+df_lstm_residuals <- df_resid %>%
+  select(date, AMZN) %>%
+  rename(AMZN_ARIMA_residuals = AMZN) %>%
+  bind_cols(df_lstm_residuals) %>%
+  mutate(AMZN_lstm_residuals = AMZN_actual - AMZN_lstm_fitted_return)
+
+plot_lstm_resid <- ggplot(df_lstm_residuals) +
+  geom_line(aes(x=date, y=AMZN_ARIMA_residuals, color = "ARIMA residuals"))+
+  geom_line(aes(x=date, y=AMZN_lstm_residuals, color = "LSTM residuals"))+
+  ggtitle("AMZN Residuals Comparison")
+
+plot_lstm_fitted <- ggplot(df_lstm_residuals) +
+  geom_line(aes(x=date, y=AMZN_actual, color = "Actual return")) +
+  geom_line(aes(x=date, y=AMZN_lstm_fitted_return, color = "LSTM fitted return"))+
+  ggtitle("AMZN return actual vs LSTM fitted")
+
+ggplotly(plot_lstm_resid)
+ggplotly(plot_lstm_fitted)
+```
+
+From the residuals comparison, it seems that the in sample training data has lower residuals than ARIMA, but the out of sample test data has a bit more; certainly not that better.
+
+Next, let's see if eGARCH can remove the time varying residuals
+Will omit NA. Will need to look into how to ensure that there's no NaN from the LSTM data
+
+```{r}
+#Settings
+MAX_GARCH_P = 5
+MAX_GARCH_Q = 5
+
+#Temporary variables
+current.symbol <- "AMZN"
+df <- na.omit(df_lstm_residuals$AMZN_lstm_residuals)
+
+# Specify and fit the GARCH model
+#Temporary variables
+final.aic <- Inf
+final.garchOrder <- c(0,0)
+for (p in 1:MAX_GARCH_P) for (q in 1:MAX_GARCH_Q) {
+  print(paste("Stock =", current.symbol, "p =", p, "q =", q))
+  spec = ugarchspec(
+    variance.model=list(model ="eGARCH",
+                        #submodel = "TGARCH",
+                        garchOrder=c(p,q)),
+    mean.model=list(armaOrder=c(0,
+                                0),
+                                include.mean=FALSE),
+    distribution.model="sged"
+  )
+  garchFit = tryCatch(
+    ugarchfit(
+      spec, df, solver = 'hybrid'
+    ),
+    error=function( err ) {
+                         message(err)
+                         return(FALSE)
+                       },
+    warning=function( err ) {
+                         #message(err)
+                         return(FALSE)
+                       } )
+
+  if( !is.logical( garchFit ) ) {
+    current.aic <- infocriteria(garchFit)[1]
+    if (current.aic < final.aic) {
+      final.aic <- current.aic
+      final.garchOrder <- c(p, q)
+      final.garch.spec <- spec
+      final.garch.fit <- garchFit
+    }
+  } else {
+    next
+  }
+}
+final.garch.fit
+```
+
+
+```{r}
+df_new_garch <-tibble(date = index(residuals(final.garch.fit,
+                                             standardize = TRUE)),
+                      lstm_residuals = residuals(final.garch.fit,
+                                       standardize = TRUE))
+
+ggplot(df_new_garch) +
+  geom_line(aes(x=date,
+                y=lstm_residuals))+
+  ggtitle("AMZN Standardised Residuals from LSTM")
+
+ggplot(df_std_resid) +
+  geom_line(aes(x=date,
+                y=AMZN))+
+  ggtitle("AMZN Standardised Residuals from ARIMA")
+```
+
+Doesn't seem that LSTM standardised residuals are better than ARIMA. In fact, there seems to be some clustering that are worse in the LSTM standardised residuals. This is really bad. We want a regular standardised residuals with no clustering or pattern etc.
+
+```{r}
+df_tmp1 <- df_new_garch %>%
+  mutate(theoretical = dsged(lstm_residuals,
+                             mean = mean(lstm_residuals),
+                             sd = sd(lstm_residuals),
+                             nu = coef(final.garch.fit)["shape"],
+                             xi = coef(final.garch.fit)["skew"])) %>%
+  arrange(lstm_residuals)
+
+df_tmp2 <- df_std_resid %>% select(AMZN) %>%
+  mutate(theoretical = dsged(AMZN,
+                             mean = mean(AMZN),
+                             sd = sd(AMZN),
+                             nu = coef(best_fit$final_fit[[1]])["shape"],
+                             xi = coef(best_fit$final_fit[[1]])["skew"])) %>%
+  arrange(AMZN)
+
+ggplot(df_tmp1) +
+  geom_density(aes(x=lstm_residuals, color="LSTM"))+
+  geom_line(aes(x=lstm_residuals, y=theoretical, color="Theoretical"))+
+  ggtitle("Density of AMZN standardised residuals, LSTM")
+
+ggplot(df_tmp2) +
+  geom_density(aes(x=AMZN, color="ARIMA"))+
+  geom_line(aes(x=AMZN, y=theoretical, color="Theoretical"))+
+  ggtitle("Density of AMZN standardised residuals")
+```
+
+Fairly clear from the plot above that the LSTM model did not improve the standardised residuals. In fact I think it made it worse! There's a large concentration along the mean from the theoretical, which means the LSTM model would be more likely to underestimate losses!

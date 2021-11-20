@@ -1,0 +1,174 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyquant)
+library(tidyverse)
+library(ggplot2)
+library(e1071)
+library(lubridate)
+library(SharpeR)
+library(PortfolioAnalytics)
+library(tbl2xts)
+library(ROI)
+library(plotly)
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+ticker <- read_csv("data/SPYticker.csv")
+
+start = '2017-01-01'
+
+
+spy <- tq_get("SPY",
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+df0 <- tq_get(ticker,
+              from = start,
+              to = today(),
+              get = "stock.prices")
+
+write_csv(df0, "data/df0.csv")
+```
+
+```{r}
+df0 <- read_csv("data/df0.csv")
+```
+
+
+```{r}
+spy1 <- spy %>%
+  select("date", "symbol", "close") %>%
+  mutate(r1 = log(close/lag(close, n=1))) %>%
+  filter(date > ymd(start) + days(2))
+
+df1 <- df0 %>%
+  select("date", "symbol", "close") %>%
+  mutate(r1 = log(close/lag(close, n=1))) %>%
+  filter(date > ymd(start) + days(2))
+```
+
+
+```{r}
+ggplot(df1,
+       aes(x= date,
+           y= r1,
+           group_by= symbol)) + 
+  geom_line()
+
+ggplot(df1)+
+  geom_histogram(aes(x= r1, group_by= symbol))
+```
+```{r}
+s_df1 <- df1 %>% 
+  group_by(symbol) %>%
+  summarise(m = mean(r1, na.rm = TRUE),
+          sd = sd(r1, na.rm = TRUE),
+          m3 = skewness(r1, na.rm = TRUE),
+          m4 = kurtosis(r1, na.rm = TRUE))
+
+s_df1
+
+p_df1 <- ggplot(s_df1) +
+          geom_point(aes(x= m,
+                         y= sd,
+                         label= symbol))
+
+ggplotly(p_df1)
+```
+
+```{r}
+df2 <- df1 %>% 
+  pivot_wider(id_cols = c(date),
+              names_from = symbol,
+              values_from = r1)
+sr1 <- df2 %>%
+  select(-date) %>%
+  as.sr()
+
+print(sr1)
+```
+
+```{r}
+xts1 <- tbl_xts(filter(df1, date > ymd(start) + days(2)), 
+                cols_to_xts = r1, 
+                spread_by= symbol)
+```
+
+
+```{r}
+funds <- colnames(xts1)
+
+# Construct initial portfolio
+init.portf <- portfolio.spec(assets=funds)
+init.portf <- add.constraint(portfolio=init.portf, type="full_investment")
+init.portf <- add.constraint(portfolio=init.portf, type="long_only")
+init.portf <- add.objective(portfolio=init.portf, type="return", name="mean")
+init.portf <- add.objective(portfolio=init.portf, type="risk", name="StdDev")
+init.portf
+
+init.portf$constraints[[1]]$min_sum=0.99
+init.portf$constraints[[1]]$max_sum=1.01
+
+# Maximizing Sharpe Ratio can be formulated as a quadratic programming 
+# problem and solved very quickly using optimize_method="ROI". Although "StdDev"
+# was specified as an objective, the quadratic programming problem uses the 
+# variance-covariance matrix in the objective function.
+
+# The default action if "mean" and "StdDev" are specified as objectives with
+# optimize_method="ROI" is to maximize quadratic utility. If we want to maximize
+# Sharpe Ratio, we need to pass in maxSR=TRUE to optimize.portfolio.
+
+maxSR.lo.ROI <- optimize.portfolio(R=xts1, portfolio=init.portf, 
+                                   optimize_method="random", 
+                                   maxSR=TRUE, trace=TRUE)
+maxSR.lo.ROI
+```
+```{r}
+saveRDS(maxSR.lo.ROI, "data/srOptimResults.rds")
+maxSR.lo.ROI <- readRDS("data/srOptimResults.rds")
+```
+
+```{r}
+maxSR_df1 <- tibble(maxSR.lo.ROI$weights) %>%
+  mutate(symbol = names(maxSR.lo.ROI$weights)) %>%
+  mutate(weight = `maxSR.lo.ROI$weights`) %>%
+  select(symbol,weight)
+```
+
+```{r}
+df3 <- df1 %>% left_join(maxSR_df1, by = "symbol") %>%
+  filter(weight>0) %>%
+  mutate(weighted_close = close*weight) %>%
+  group_by(date) %>%
+  summarise(portfolio = sum(weighted_close))
+
+df4 <- df3 %>%
+  left_join(select(spy1, date, close), by = "date") %>%
+  rename("spy" = close) %>%
+  mutate(spy = spy / rep(spy[1], nrow(df3)) *1000) %>%
+  mutate(portfolio = portfolio / rep(portfolio[1], nrow(df3))*1000) %>%
+  pivot_longer(cols = c(portfolio, spy),
+               names_to = "type",
+               values_to = "close")
+p_df4 <- ggplot(df4) +
+  geom_line(aes(x= date, y= close, color = type))
+ggplotly(p_df4)
+```
+
+
+
+
+

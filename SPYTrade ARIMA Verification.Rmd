@@ -1,0 +1,140 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+library(tidyquant)
+library(tidyverse)
+library(ggplot2)
+library(e1071)
+library(lubridate)
+library(SharpeR)
+library(PortfolioAnalytics)
+library(tbl2xts)
+library(ROI)
+library(plotly)
+library(naniar)
+library(broom)
+library(quantmod)
+library(rugarch)
+library(rmgarch)
+library(tseries)
+library(forecast)
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+ticker <- read_csv("data/SPYticker.csv")
+
+start = '2017-01-01'
+
+```
+
+```{r}
+spy <- tq_get("SPY",
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+all_stock <- tq_get("ZM",
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r}
+write_csv(all_stock, "data/df0.csv")
+```
+
+```{r}
+all_stock <- read_csv("data/df0.csv")
+```
+
+```{r}
+#Subset data into training and verification
+#verification data from today - n days
+
+N_VERIFICATION <- 18 #days
+
+spy_train <- spy %>% filter(date < today()-days(N_VERIFICATION))
+all_stock_train <- all_stock %>% filter(date<today()-days(N_VERIFICATION))
+
+spy_verify <- spy %>% filter(date >= today()-days(N_VERIFICATION))
+all_stock_verify <- all_stock %>% filter(date >= today()-days(N_VERIFICATION))
+
+```
+
+``` {r, warning = FALSE}
+df1 <- all_stock_train %>% select(date, symbol, close) %>%
+  mutate(log_close = log(close)) %>%
+  mutate(log_return = log_close - lag(log_close, n = 1)) %>%
+  na.omit()
+
+xts1 <- tbl_xts(df1, 
+              cols_to_xts = log_return, 
+              spread_by= symbol)
+
+p = 1
+q = 1
+
+arma_fit <- arma(xts1, order = c(3,3))
+
+```
+
+``` {r}
+summary(arma_fit)
+df_plot <- df1 %>%
+  select(date, log_return) %>%
+  bind_cols(tibble(fitted.values = fitted.values(arma_fit),
+                   residuals = residuals(arma_fit)))
+
+#fit mean only to compare
+mean_fit <- df1 %>%
+  select(date, log_return) %>%
+  mutate(mean_fitted = mean(log_return))%>%
+  mutate(mean_residuals = mean_fitted - log_return)%>%
+  select(-log_return)
+
+df_plot <- df_plot %>% left_join(mean_fit, by = "date")
+
+
+
+ggplot(df_plot) +
+  geom_line(aes(x= date,
+                y= residuals,
+                color = "arma")) +
+  geom_line(aes(x= date,
+                y= mean_residuals,
+                color = "mean only"))
+```
+```{r}
+#Fit to price to N_VERIFICATION days
+df_verification <- all_stock_verify %>% select(date, symbol, close) %>%
+  mutate(log_close = log(close)) %>%
+  mutate(log_return = log_close - lag(log_close, n = 1)) %>%
+  na.omit()
+
+df_copy <- df1 %>%
+  bind_rows(df_verification)
+
+arma_fit_coef <- coef(arma_fit)
+#Get the 3 last rows from train
+df2 <- df1 %>% tail(n = 3) %>% select (date, log_return)
+```
+
+```{r}
+arma_fit <- arma (xts1, order = c(1,1))
+arima_fit <- arima(xts1, order = c(1,0,1))
+#arma_forecast <- predict(arma_fit, n.ahead = N_VERIFICATION)
+
+summary(arma_fit)
+summary(arima_fit)
+```

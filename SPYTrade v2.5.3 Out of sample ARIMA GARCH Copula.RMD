@@ -1,0 +1,783 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+Objective:
+Do proper out of sample forecasting (5 days), see how the model performs along the 5 days.
+Also make the whole dataframe tidier, make it so it can handle more than 2 assets.
+Actively delete unused objects and variables to save on memory.
+Extension: look into multi path forecasting + data assimilation to combine the different estimates.
+
+Difference to v2.5.2:
+No LSTM estimates at the end
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+EVAL_GARCH_OPTION = FALSE
+```
+
+```{r}
+library(quantmod)
+library(lattice)
+library(timeSeries)
+library(rugarch)
+library(xts)
+library(tidyverse)
+library(tidyquant)
+library(visdat)
+```
+
+# 1.0 Data tidying
+Download the data
+```{r, warning = FALSE, echo = FALSE}
+#Download data
+ticker = c("AAPL",
+           "AMZN",
+           "MSFT",
+           "NKE",
+           "WMT",
+           "WST",
+           "MA",
+           "LMT",
+           "RTX",
+           "REGN")
+all_stock <- tq_get(ticker,
+              from = "2019-11-01",
+              to = "2021-11-01",
+              get = "stock.prices") %>%
+  select(symbol, date, close) %>%
+  mutate(lret = c(0, diff(log(close))))
+
+#Turn all first days returns to 0
+first_day <- all_stock %>%
+  group_by(symbol) %>%
+  summarise(date = min(date)) %>%
+  left_join(all_stock, by = c("symbol" = "symbol", "date" = "date")) %>%
+  mutate(lret = 0)
+
+all_stock <- all_stock %>% 
+  anti_join(first_day, by = c("symbol" = "symbol", "date" = "date")) %>%
+  bind_rows(first_day) %>%
+  arrange(date)
+
+#Delete objects
+rm(first_day)
+```
+
+Split the data into training and verification data
+2/3 training, 1/3 training
+```{r}
+#Split the data into its individual symbols
+all_stock_lret <- pivot_wider(all_stock,
+                              id_cols = date,
+                              names_from = symbol,
+                              values_from = lret,
+                              names_glue = "{symbol}.lret")
+all_stock_close <- pivot_wider(all_stock,
+                               id_cols = date,
+                               names_from = symbol,
+                               values_from = close,
+                               names_glue = "{symbol}.close")
+
+all_stock <- all_stock_lret %>% 
+  full_join(all_stock_close, by ="date")
+
+#Remove 1/3 amount of observations for verification later
+N_TRAIN = ceiling(nrow(all_stock_lret)*2/3)
+N_VERIFICATION = nrow(all_stock_lret) - N_TRAIN
+
+all_stock_train <- all_stock %>%
+  head(N_TRAIN)
+
+all_stock_verification <- all_stock %>%
+  tail(N_VERIFICATION)
+
+#Delete objects
+rm(all_stock_lret, all_stock_close)
+```
+
+Check for any missing data
+```{r}
+vis_miss(all_stock %>% select(ends_with(".lret")))
+vis_miss(all_stock %>% select(ends_with(".close")))
+```
+See correlation
+See both Pearson's and Spearman's (Assuming no normal dependencies)
+```{r}
+library(ggcorrplot)
+ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "pearson"), lab=TRUE)
+ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "spearman"), lab=TRUE)
+```
+Let's stick with AMZN and MSFT first, then generalise if possible
+```{r}
+select_ticker = c("AMZN", "MSFT", "AAPL", "RTX", "WMT")
+
+all_stock <- all_stock %>%
+  select(date, starts_with(select_ticker))
+all_stock_train <- all_stock_train %>%
+  select(date, starts_with(select_ticker))
+all_stock_verification <- all_stock_verification %>%
+  select(date, starts_with(select_ticker))
+
+ticker = select_ticker
+```
+
+# 2.0 Fit into ARIMA-eGARCH model
+```{r}
+#Find best fit ARIMA and GARCH (Asymmetric) specification for all stocks
+best_fit <- tibble(symbol = ticker,
+               ARIMA_AIC = Inf,
+               GARCH_AIC = Inf,
+               ARIMA_p = 1,
+               ARIMA_d = 0,
+               ARIMA_q = 1,
+               GARCH_p = 1,
+               GARCH_q = 1,
+               spec = list(0),
+               final_fit = list(0)) %>%
+  nest(order = c(ARIMA_p, ARIMA_d, ARIMA_q, GARCH_p, GARCH_q))
+```
+
+
+# Find best ARIMA-GARCH model based on AIC
+Note 16/11/2021 - 
+Sometimes ugarchfit() fails to converge (example is AAPL data) for the best ARIMA lags, but converges for lower ARIMA lags. Maybe need to temporarily store the AIC of all ARIMA model, and walk backward the ARIMA model from best to worse AIC if GARCH fails to converge
+
+```{r, eval = EVAL_GARCH_OPTION}
+library(timetk)
+
+#Settings
+ERR_DIST = "std" #norm, snorm, std, sstd, ged, sged
+MAX_ARIMA_P = 5
+MAX_ARIMA_Q = 5
+MAX_GARCH_P = 5
+MAX_GARCH_Q = 5
+n=0
+
+for (i in ticker) {
+  n = n + 1
+  #Temporary variables
+  current.symbol <- i
+  #Convert to XTS object to maintain date consistencies
+  df_xts <- tk_xts(all_stock_train,
+                   select = paste(current.symbol, ".lret", sep =""),
+                   date_var = "date")
+  
+  #Temporary dataframe to store the results for all ARIMA
+  #Will not store ARIMA results that are problematic
+  df_arima_results <- tibble(p=0,
+                             d=0,
+                             q=0,
+                             AIC = Inf)
+  
+  
+
+  for (p in 0:MAX_ARIMA_P) for (q in 0:MAX_ARIMA_Q) {
+    if ( p == 0 && q == 0) {
+      next
+    }
+    arimaFit = tryCatch( arima(df_xts, order=c(p, 0, q)),
+                         error=function( err ) {
+                           message(err)
+                           return(FALSE)
+                         },
+                         warning=function( err ) {
+                           # message(err)
+                           return(FALSE)
+                         } )
+
+    if( !is.logical( arimaFit ) ) {
+      df_arima_results <- df_arima_results %>%
+        bind_rows(tibble(p = p,
+                         d = 0,
+                         q = q,
+                         AIC = AIC(arimaFit)))
+    } else {
+      next
+    }
+  }
+  
+  #Sort the results based on the best AIC
+  df_arima_results <- df_arima_results %>%
+    arrange(AIC)
+  
+  #Fit GARCH specification
+  #Move down the best AIC table if no solution can be found for all lags
+  final.aic <- Inf
+  m = 0
+  while (final.aic == Inf & m < nrow(df_arima_results)){
+    #Move down the best AIC table if no solution can be found for all lags
+    m = m + 1
+    final.aic <- Inf
+    ARIMA_p <- df_arima_results$p[m]
+    ARIMA_d <- df_arima_results$d[m]
+    ARIMA_q <- df_arima_results$q[m]
+    final.garchOrder <- c(0,0)
+    
+    for (p in 1:MAX_GARCH_P) for (q in 1:MAX_GARCH_Q) {
+      print(paste("Stock =", current.symbol, 
+                  "ARIMA p =", ARIMA_p,
+                  "ARIMA d =", ARIMA_d,
+                  "ARIMA q =", ARIMA_q,
+                  "GARCH p =", p,
+                  "GARCH q =", q))
+      spec = ugarchspec(
+        variance.model=list(model ="eGARCH",
+                            #submodel = "TGARCH",
+                            garchOrder=c(p,q)),
+        mean.model=list(armaOrder=c(ARIMA_p,
+                                    ARIMA_q),
+                                    include.mean=T),
+        distribution.model= ERR_DIST
+      )
+      garchFit = tryCatch(
+        ugarchfit(
+          spec, df_xts, solver = 'hybrid'
+        ),
+        error=function( err ) {
+                             message(err)
+                             return(FALSE)
+                           },
+        warning=function( err ) {
+                             #message(err)
+                             return(FALSE)
+                           } )
+  
+      if( !is.logical( garchFit ) ) {
+        current.aic <- infocriteria(garchFit)[1]
+        if (current.aic < final.aic) {
+          final.aic <- current.aic
+          final.garchOrder <- c(p, q)
+          final.garch.spec <- spec
+          final.garch.fit <- garchFit
+        }
+      } else {
+        next
+      }
+    }
+    if (final.aic == Inf){
+      print(paste("No GARCH specification found for stock",
+                  current.symbol,
+                  "ARIMA(",
+                  p, ", ", d, ", ", q, ")"))
+    }
+  }
+  
+  #Throw an error if no GARCH specification could be found with all valid ARIMA models
+  if (final.aic == Inf){
+    message("ERR: No GARCH specification can be found")
+  }
+  
+  #Store the results
+  #Store the ARIMA results
+  best_fit$order[[n]]$ARIMA_p = ARIMA_p
+  best_fit$order[[n]]$ARIMA_d = ARIMA_d
+  best_fit$order[[n]]$ARIMA_q = ARIMA_q
+  #Store the GARCH results
+  best_fit$spec[[n]] = final.garch.spec
+  best_fit$final_fit[[n]] = final.garch.fit
+  best_fit$order[[n]]$GARCH_p = final.garchOrder[1]
+  best_fit$order[[n]]$GARCH_q = final.garchOrder[2]
+  #Store the AICs
+  best_fit$ARIMA_AIC[n] <- df_arima_results$AIC[m]
+  best_fit$GARCH_AIC[n] <- final.aic
+}
+
+#Save to RDS
+saveRDS(best_fit, "data/best_fit.rds")
+
+#Delete from memory
+rm(arimaFit, df_arima_results, df_xts, final.garch.fit,
+   final.garch.spec, garchFit, spec, ARIMA_d, ARIMA_p, 
+   ARIMA_q, current.aic,current.symbol, final.aic, final.garchOrder,
+   i, m, MAX_ARIMA_P, MAX_ARIMA_Q, MAX_GARCH_P, MAX_GARCH_Q, n, p, 
+   q)
+```
+Load
+```{r}
+best_fit <- readRDS("data/best_fit.rds")
+```
+
+```{r}
+#Construct the uGARCHfit and uGARCHspec objects
+# best_fit$spec <- map(best_fit$order, function(order){
+#   ARIMA_p = order$ARIMA_p
+#   ARIMA_d = order$ARIMA_d
+#   ARIMA_q = order$ARIMA_q
+#   GARCH_p = order$GARCH_p
+#   GARCH_q = order$GARCH_q
+#   
+#   result <- ugarchspec(
+#     variance.model=list(model ="eGARCH",
+#                         #submodel = "TGARCH",
+#                         garchOrder=c(GARCH_p, GARCH_q)),
+#     mean.model=list(armaOrder=c(ARIMA_p, 
+#                                 ARIMA_q), 
+#                     include.mean=T),
+#     distribution.model="sged"
+#   )
+#   return(result)
+# })
+# 
+# best_fit$final_fit <- map(best_fit$spec, )
+```
+
+Get the residuals and fitted values
+```{r, warning = FALSE}
+df_garch_results <- all_stock_train %>%
+  bind_cols(
+    map(best_fit$final_fit, residuals) %>%
+    set_names(paste(ticker, ".resid", sep = "")) %>%
+    as_tibble() 
+  ) %>%
+  bind_cols(
+    map(best_fit$final_fit, residuals, standardize = TRUE) %>%
+    set_names(paste(ticker, ".std_resid", sep = "")) %>%
+    as_tibble()
+  ) %>%
+  bind_cols(
+    map(best_fit$final_fit, sigma) %>%
+    set_names(paste(ticker, ".sigma", sep = "")) %>%
+    as_tibble()
+  ) %>%
+  bind_cols(
+    map(best_fit$final_fit, fitted) %>%
+    set_names(paste(ticker, ".fitted", sep = "")) %>%
+    as_tibble()
+  )
+
+ggplot(df_garch_results %>%
+         select(date, ends_with(".resid")) %>%
+         pivot_longer(cols = -date,
+                      names_to = "symbol",
+                      values_to = "residual")) +
+  geom_line(aes(x=date, y = residual, color = symbol)) +
+  ggtitle("Non-standardised residuals from ARIMA-GARCH")
+
+ggplot(df_garch_results %>%
+         select(date, ends_with(".std_resid")) %>%
+         pivot_longer(cols = -date,
+                      names_to = "symbol",
+                      values_to = "std_residual")) +
+  geom_line(aes(x=date, y = std_residual, color = symbol)) +
+  ggtitle("Standardised residuals from ARIMA-GARCH")
+```
+
+Extract the coefficients of the standardised residual distributions, 
+and append it to the best_fit df
+```{r, warning= FALSE}
+library(fGarch)
+best_fit <- best_fit %>%
+  full_join(
+    df_garch_results %>%
+    select(ends_with(".std_resid")) %>%
+    pivot_longer(cols = everything(),
+                 names_to = "symbol",
+                 values_to = "std_resid") %>%
+    mutate(symbol = gsub(".std_resid","",symbol)) %>%
+    group_by(symbol) %>%
+    summarise(std_resid.mean = mean(std_resid),
+              std_resid.sd = sd(std_resid)) %>%
+    bind_cols(std_resid.shape = sapply(map(best_fit$final_fit, coef), 
+                                       function(x){x["shape"]})) %>%
+    bind_cols(std_resid.skew = sapply(map(best_fit$final_fit, coef), 
+                            function(x){x["skew"]})),
+    by = "symbol")
+```
+```{r}
+df_fitted_pdf <- df_garch_results %>%
+  select(ends_with(".std_resid")) %>%
+  pivot_longer(cols = everything(),
+               names_to = "symbol",
+               values_to = "std_resid") %>%
+  mutate(symbol = gsub(".std_resid","",symbol)) %>%
+  left_join(best_fit %>% select(c(symbol,
+                                  std_resid.mean:std_resid.skew)),
+            by = "symbol") %>%
+  mutate(norm_pdf = dnorm(std_resid, 
+                          mean= std_resid.mean,
+                          sd = std_resid.sd))
+if(ERR_DIST == "sged"){
+  df_fitted_pdf <- df_fitted_pdf %>%
+    mutate(std_err_pdf = dsged(std_resid, 
+                            mean= std_resid.mean,
+                            sd = std_resid.sd,
+                            nu = std_resid.shape,
+                            xi = std_resid.skew))
+} else if(ERR_DIST == "sstd"){
+  df_fitted_pdf <- df_fitted_pdf %>%
+    mutate(std_err_pdf = dsstd(std_resid, 
+                            mean= std_resid.mean,
+                            sd = std_resid.sd,
+                            nu = std_resid.shape,
+                            xi = std_resid.skew))
+} else if(ERR_DIST == "std"){
+  df_fitted_pdf <- df_fitted_pdf %>%
+    mutate(std_err_pdf = dstd(std_resid, 
+                           mean= std_resid.mean,
+                           sd = std_resid.sd,
+                           nu = std_resid.shape))
+} else if(ERR_DIST == "ged"){
+  df_fitted_pdf <- df_fitted_pdf %>%
+    mutate(std_err_pdf = dged(std_resid, 
+                           mean= std_resid.mean,
+                           sd = std_resid.sd,
+                           nu = std_resid.shape))
+} else if(ERR_DIST == "snorm"){
+  df_fitted_pdf <- df_fitted_pdf %>%
+    mutate(std_err_pdf = dsnorm(std_resid, 
+                           mean= std_resid.mean,
+                           sd = std_resid.sd,
+                           xi = std_resid.skew))
+} else if(ERR_DIST == "norm") {
+  df_fitted_pdf <- df_fitted_pdf %>%
+    mutate(std_err_pdf = norm_pdf)
+}
+  
+
+ggplot(df_fitted_pdf) +
+  geom_density(aes(x=std_resid, color = "Actual std resid")) +
+  geom_line(aes(x=std_resid, y=norm_pdf, color = "Theoretical Normal"))+
+  geom_line(aes(x=std_resid, y=std_err_pdf, color = paste("Theoretical", ERR_DIST)))+
+  facet_wrap(~symbol)+
+  ggtitle("Standardised Residual, theoretical distribution vs actual")
+```
+Using t-distribution for standardised residuals. seems that AMZN fits pretty well except for some end tail, and MSFT fits normal better for this case
+
+
+```{r}
+ggplot(df_fitted_pdf) +
+  stat_ecdf(aes(x=std_resid, color = "actual ecdf")) +
+  facet_wrap(~symbol)
+```
+
+
+```{r}
+ggplot(df_fitted_pdf) +
+  geom_qq(aes(sample=std_resid),
+               distribution = fGarch::qstd,
+               dparams = list(mean = df_fitted_pdf$std_resid.mean,
+                              sd = df_fitted_pdf$std_resid.sd,
+                              nu = df_fitted_pdf$std_resid.shape)) +
+  facet_wrap(~symbol)
+```
+
+===========
+
+```{r}
+#Transform the standardised residuals into CDF of selected standardised error distribution
+
+df_cdf_std_resid <- df_fitted_pdf %>%
+  mutate(AMZN_CDF = pstd(AMZN,
+                           mean = mean(AMZN),
+                           sd = sd(AMZN),
+                           nu = coef(best_fit$final_fit[[1]])["shape"],
+                           xi = coef(best_fit$final_fit[[1]])["skew"])) %>%
+  mutate(MSFT_CDF = pnorm(MSFT,
+                           mean = mean(MSFT),
+                           sd = sd(MSFT)))
+ggplot(df_cdf_std_resid)+
+  geom_histogram(aes(x=AMZN_CDF, fill="AMZN"))+
+  ggtitle("Density of standardised residual CDF")
+ggplot(df_cdf_std_resid)+
+  geom_histogram(aes(x=MSFT_CDF, fill="MSFT"))+
+  ggtitle("Density of standardised residual CDF")
+```
+
+Plot the two in a scatter plot
+```{r}
+ggplot(df_cdf_std_resid,
+       aes(x = AMZN_CDF,
+           y = MSFT_CDF)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+Check the correlation between the two stocks and their CDF
+```{r}
+library(psych)
+#NOTE all are residuals of the ARIMA-GARCH model
+pairs.panels(df_cdf_std_resid %>% select(AMZN_CDF, MSFT_CDF))
+pairs.panels(df_cdf_std_resid %>% select(AMZN, MSFT))
+```
+
+Fit a Copula to the stocks
+Restrict to independent, gaussian and t copula
+Note 16/11/2021 - Study other kinds of copula. When unrestricted, the function tries to fit a "survival BB8" copula. Not sure what that is.
+```{r}
+library(VineCopula)
+u1 <- df_cdf_std_resid$AMZN_CDF
+u2 <- df_cdf_std_resid$MSFT_CDF
+selectedCopula <- BiCopSelect(u1 = u1, u2 = u2, familyset = c(0:2))
+selectedCopula
+```
+
+Fit it using copula library, should give the same result as the above
+```{r}
+library(copula)
+t.cop <- tCopula(dim=2)
+fit <- fitCopula(t.cop,cbind(u1,u2),method='ml')
+coef(fit)
+```
+
+Create n random samples from the copula, see if they look similar to the AMZN and MSFT data we had
+
+```{r}
+n = 100000
+param1 = coef(fit)["rho.1"]
+param2 = coef(fit)["df"]
+set.seed(1)
+uRandom <- rCopula(n, tCopula(c(param1), dim =2, df= param2))
+
+#Construct a df, and plot
+df_copula <- df_cdf_std_resid %>% 
+  select(AMZN_CDF, MSFT_CDF) %>%
+  mutate(label = "actual") %>%
+  bind_rows(tibble(AMZN_CDF = uRandom[,1],
+                   MSFT_CDF = uRandom[,2],
+                   label = "random generation"))
+
+ggplot(df_copula)+
+  geom_point(aes(x=AMZN_CDF,
+                 y=MSFT_CDF,
+                 color = label)) +
+  ggtitle("Randomly Generated t-Copula")
+
+```
+
+Use the randomly generated CDF returns from the Copula and compare it with the actual return
+```{r}
+mean = mean(df_std_resid$AMZN)
+sd = sd(df_std_resid$AMZN)
+nu = coef(best_fit$final_fit[[1]])["shape"]
+xi = coef(best_fit$final_fit[[1]])["skew"]
+
+df_copula <- df_copula %>%
+  mutate(AMZN_RAND_RESID = qsged(AMZN_CDF,
+                                 mean = mean,
+                                 sd = sd,
+                                 nu = nu,
+                                 xi = xi))
+
+mean = mean(df_std_resid$MSFT)
+sd = sd(df_std_resid$MSFT)
+
+df_copula <- df_copula %>%
+  mutate(MSFT_RAND_RESID = qnorm(MSFT_CDF,
+                                 mean = mean,
+                                 sd = sd))
+
+#Plus calcualte the copula (joint probability)
+param1 = coef(fit)["rho.1"]
+param2 = coef(fit)["df"]
+
+joint_prob <- dCopula(array(c(df_copula$AMZN_CDF, df_copula$MSFT_CDF), 
+                            dim = c(length(df_copula$AMZN_CDF), 2)), 
+                      tCopula(c(param1), dim =2, df= param2))
+
+df_copula <- df_copula %>%
+  bind_cols(joint_prob = joint_prob)
+
+
+ggplot(df_copula) +
+  geom_density(aes(x=AMZN_RAND_RESID, color = label)) +
+  ggtitle("AMZN actual vs randomly generated standardised residuals")
+
+ggplot(df_copula) +
+  geom_density(aes(x=MSFT_RAND_RESID, color = label)) +
+  ggtitle("MSFT actual vs randomly generated standardised residuals")
+```
+Use the randomly generated standardised residuals to construct a 5% VaR of a portfolio of 50% AMZN and 50% MSFT.
+
+Steps:
+1. Using the randomly generated residuals, calculate the 1 step estimate, i.e.
+
+$$ X_{t} = ARIMA + e_t$$
+$$ e_t = \sigma_t * u_t$$
+u_t is the randomly generated standardised residuals
+$$ \sigma_t^2 = GARCH$$
+
+
+
+```{r}
+#Get the standardised residuals which were randomly generated before
+df_VaR_std_resid <- df_copula %>% filter(label=="random generation") %>%
+  select(AMZN_RAND_RESID, MSFT_RAND_RESID) %>%
+  rename(AMZN_std_resid = AMZN_RAND_RESID) %>%
+  rename(MSFT_std_resid = MSFT_RAND_RESID)
+
+#Calculate the residuals = sigma * standardised residuals
+df_VaR <- tibble(date = index(sigma(best_fit$final_fit[[1]])),
+                 AMZN_sigma = sigma(best_fit$final_fit[[1]])) %>%
+  full_join(tibble(date = index(sigma(best_fit$final_fit[[2]])),
+                   MSFT_sigma = sigma(best_fit$final_fit[[2]])),
+            by = "date")
+df_VaR <- df_VaR %>%
+  bind_cols("AMZN_resid" = coredata(df_VaR$AMZN_sigma) %*% t(df_VaR_std_resid$AMZN_std_resid))%>%
+  bind_cols("MSFT_resid" = coredata(df_VaR$MSFT_sigma) %*% t(df_VaR_std_resid$MSFT_std_resid))
+
+#Plot one of the realisation
+plot(density(df_VaR$AMZN_resid[1,]))
+
+#Calculate the 5% VaR
+temp <- matrix(0, nrow = nrow(df_VaR), ncol = 2)
+for (i in 1:nrow(df_VaR)){
+  temp[i,1] <- quantile(df_VaR$AMZN_resid[i,], prob = 0.05)
+  temp[i,2] <- quantile(df_VaR$MSFT_resid[i,], prob = 0.05)
+}
+
+df_VaR <- df_VaR %>%
+  bind_cols(AMZN_VaR = temp[,1]) %>%
+  bind_cols(MSFT_VaR = temp[,2])
+
+#Combine the fitted value with the VaR
+df_VaR <- df_VaR %>%
+  bind_cols(AMZN_fitted = fitted(best_fit$final_fit[[1]])) %>%
+  bind_cols(MSFT_fitted = fitted(best_fit$final_fit[[2]])) %>%
+  mutate(AMZN_VaR = AMZN_fitted + AMZN_VaR) %>%
+  mutate(MSFT_VaR = MSFT_fitted + MSFT_VaR) 
+
+#Combine with the actual return data
+df_VaR <- df_VaR %>%
+  bind_cols(all_stock_train %>% 
+              filter(symbol == "AMZN") %>%
+              select(lret) %>%
+              rename(AMZN_actual = lret)) %>%
+  bind_cols(all_stock_train %>% 
+              filter(symbol == "MSFT") %>%
+              select(lret) %>%
+              rename(MSFT_actual = lret))
+
+#Plot each stock with its actual and VaR
+ggplot(df_VaR)+
+  geom_line(aes(x= date, y=AMZN_actual, color= "actual")) +
+  geom_line(aes(x= date, y=AMZN_fitted, color= "fitted")) +
+  geom_line(aes(x= date, y=AMZN_VaR, color= "5% VaR")) +
+  ggtitle("AMZN Return and 5% VaR")
+
+ggplot(df_VaR)+
+  geom_line(aes(x= date, y=MSFT_actual, color= "actual")) +
+  geom_line(aes(x= date, y=MSFT_fitted, color= "fitted")) +
+  geom_line(aes(x= date, y=MSFT_VaR, color= "5% VaR")) +
+  ggtitle("MSFT Return and 5% VaR")
+
+#Calculate number of exceedance of 5% VaR
+
+df_VaR %>% 
+  mutate(AMZN_exceed = AMZN_actual<AMZN_VaR) %>%
+  mutate(MSFT_exceed = MSFT_actual<MSFT_VaR) %>%
+  select(AMZN_exceed, MSFT_exceed) %>%
+  pivot_longer(cols = c(AMZN_exceed, MSFT_exceed),
+               names_to = "symbol",
+               values_to = "exceed") %>%
+  group_by(symbol) %>%
+  summarise(exceed_num = sum(exceed),
+            exceed_prop = sum(exceed)/nrow(df_VaR),
+            expected = 0.05*nrow(df_VaR))
+
+
+```
+
+Explore the CDF of the actual and fitted return
+Using the simulated return data
+Note the fitted return will always be close to 50% quantile, as by definition they are the mean
+
+```{r}
+df_return_cdf <- df_VaR %>% 
+  select(date, 
+         AMZN_resid, MSFT_resid, 
+         AMZN_fitted, MSFT_fitted, 
+         AMZN_actual, MSFT_actual)
+
+#Calculate the simulated portfolio returns
+temp_sim_AMZN <- matrix(0, 
+                    nrow = nrow(df_return_cdf$AMZN_resid), 
+                    ncol = ncol(df_return_cdf$AMZN_resid))
+temp_sim_MSFT <- matrix(0, 
+                    nrow = nrow(df_return_cdf$MSFT_resid), 
+                    ncol = ncol(df_return_cdf$MSFT_resid))
+#Calculate the CDF of the actual return
+temp_actual_AMZN <- matrix(0, 
+                    nrow = nrow(df_return_cdf$AMZN_resid), 
+                    ncol = 1)
+temp_actual_MSFT <- matrix(0, 
+                    nrow = nrow(df_return_cdf$MSFT_resid), 
+                    ncol = 1)
+#Calculate the CDF of the fitted return
+temp_fitted_AMZN <- temp_actual_AMZN
+temp_fitted_MSFT <- temp_actual_MSFT
+
+#Function to return empirical quantile (CDF) given data and the number
+equantile <- function(data, value){
+    tmp_a <- ecdf(data)
+    return(tmp_a(value))
+}
+
+#Note the performance of the loop is very poor. Need to look into the data structure and find more efficient ways of doing this
+
+for (i in 1:nrow(df_return_cdf)){
+  #Calculate the simulated portfolio returns
+  temp_sim_AMZN[i,] <- df_return_cdf$AMZN_resid[i,] + rep(df_return_cdf$AMZN_fitted[i], times = ncol(temp_sim_AMZN))
+  temp_sim_MSFT[i,] <- df_return_cdf$MSFT_resid[i,] + rep(df_return_cdf$MSFT_fitted[i], times = ncol(temp_sim_AMZN))
+  
+  #Calculate the CDF of the actual return
+  temp_actual_AMZN[i] <- equantile(temp_sim_AMZN[i,],
+                                   df_return_cdf$AMZN_actual[i])
+  temp_actual_MSFT[i] <- equantile(temp_sim_MSFT[i,],
+                                df_return_cdf$MSFT_actual[i])
+  
+  #Calculate the CDF of the fitted return
+  temp_fitted_AMZN[i] <- equantile(temp_sim_AMZN[i,],
+                                df_return_cdf$AMZN_fitted[i])
+  temp_fitted_MSFT[i] <- equantile(temp_sim_MSFT[i,],
+                                df_return_cdf$MSFT_fitted[i])
+}
+
+df_return_cdf <- df_return_cdf %>%
+  bind_cols("AMZN_simulated_return" = temp_sim_AMZN) %>%
+  bind_cols("MSFT_simulated_return" = temp_sim_MSFT) %>%
+  bind_cols("AMZN_actual_quantile" = temp_actual_AMZN) %>%
+  bind_cols("MSFT_actual_quantile" = temp_actual_MSFT) %>%
+  bind_cols("AMZN_fitted_quantile" = temp_fitted_AMZN) %>%
+  bind_cols("MSFT_fitted_quantile" = temp_fitted_MSFT)
+
+rm(temp_sim_AMZN, temp_sim_MSFT, 
+   temp_actual_AMZN, temp_actual_MSFT,
+   temp_fitted_AMZN, temp_fitted_MSFT)
+```
+
+Plot the CDF
+```{r}
+#Plot the results
+plot_return_cdf <- ggplot(df_return_cdf) +
+  geom_line(aes(x=date,
+                 y=AMZN_actual_quantile,
+                 color = "AMZN"))+
+  geom_line(aes(x=date,
+                 y=MSFT_actual_quantile,
+                 color = "MSFT"))+
+  geom_line(aes(x=date,
+                 y=AMZN_fitted_quantile,
+                 color = "AMZN fitted"))+
+  geom_line(aes(x=date,
+                 y=MSFT_fitted_quantile,
+                 color = "MSFT fitted")) +
+  geom_hline(aes(color = "5% VaR"),yintercept = 0.05)
+  ggtitle("AMZN, MSFT actual and fitted return quantile based on empirical CDF of 100,000 randomly generated date from ARIMA-eGARCH-tCopula model")
+
+ggplot(df_return_cdf)+
+  stat_ecdf(aes(x= AMZN_actual_quantile,
+                color = "AMZN"), 
+            geom="line") +
+  stat_ecdf(aes(x= MSFT_actual_quantile,
+                color = "MSFT"), 
+            geom="line") +
+  geom_abline(aes(color = "Theoretical"),slope = 1, intercept = 0) +
+  ggtitle("CDF distribution of AMZN, MSFT. 45 degree line indicates theoretical value")
+  
+library(plotly)
+ggplotly(plot_return_cdf)
+```

@@ -1,0 +1,175 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(quantmod)
+library(lattice)
+library(timeSeries)
+library(rugarch)
+library(xts)
+library(tidyverse)
+```
+
+```{r}
+getSymbols("ZUO", from="2020-01-01")
+spReturns = diff(log(Cl(ZUO)))
+spReturns[as.character(head(index(Cl(ZUO)),1))] = 0
+
+#windowLength = 14
+#foreLength = length(spReturns) - windowLength
+#forecasts <- vector(mode="character", length=foreLength)
+```
+```{r}
+N_VERIFICATION <- 14
+spReturnsOffset <- spReturns[1:(length(spReturns)-N_VERIFICATION)]
+
+final.aic <- Inf
+final.order <- c(0,0,0)
+for (p in 0:5) for (q in 0:5) {
+  if ( p == 0 && q == 0) {
+    next
+  }
+  
+  arimaFit = tryCatch( arima(spReturnsOffset, order=c(p, 0, q)),
+                       error=function( err ) {
+                         message(err)
+                         return(FALSE)
+                       },
+                       warning=function( err ) {
+                         # message(err)
+                         return(FALSE)
+                       } )
+  
+  if( !is.logical( arimaFit ) ) {
+    current.aic <- AIC(arimaFit)
+    if (current.aic < final.aic) {
+      final.aic <- current.aic
+      final.order <- c(p, 0, q)
+      # final.arima <- arima(spReturnsOffset, order=final.order)
+      final.arima <- arimaFit
+    }
+  } else {
+    next
+  }
+}
+
+# test for the case we have not achieved a solution  
+if (final.order[1]==0 && final.order[3]==0) {
+  final.order[1] = 1
+  final.order[3] = 1
+}
+```
+```{r}
+# Specify and fit the GARCH model
+final.aic <- Inf
+final.garchOrder <- c(0,0)
+for (p in 1:5) for (q in 1:5) {
+  print(paste("p =", p, "q =", q))
+  spec = ugarchspec(
+    variance.model=list(model ="eGARCH",
+                        #submodel = "TGARCH",
+                        garchOrder=c(p,q)),
+    mean.model=list(armaOrder=c(final.order[1], final.order[3]), include.mean=T),
+    distribution.model="sged"
+  )
+  garchFit = tryCatch(
+    ugarchfit(
+      spec, spReturnsOffset, solver = 'hybrid'
+    ), 
+    error=function( err ) {
+                         message(err)
+                         return(FALSE)
+                       },
+    warning=function( err ) {
+                         # message(err)
+                         return(FALSE)
+                       } )
+  
+  if( !is.logical( garchFit ) ) {
+    current.aic <- infocriteria(garchFit)[1]
+    if (current.aic < final.aic) {
+      final.aic <- current.aic
+      final.garchOrder <- c(p, q)
+      fit <- garchFit
+    }
+  } else {
+    next
+  }
+}
+```
+
+```{r}
+df_resid <- tibble(date = index(residuals(fit)),
+                   residuals = residuals(fit),
+                   standard_resid = residuals(fit, standardize = T))
+
+ggplot(df_resid) +
+  geom_line(aes(x= date,
+                y= residuals))
+ggplot(df_resid) +
+  geom_line(aes(x= date,
+                y= standard_resid))
+
+```
+
+```{r}
+spFore <- ugarchforecast(fit, n.ahead=N_VERIFICATION)
+
+
+tail_spReturns <- tail(spReturns, N_VERIFICATION)
+df_plot <- tibble(date = index(tail_spReturns),
+                  actual = tail_spReturns$ZUO,
+                  forecast = fitted(spFore))
+
+ggplot(df_plot) + 
+  geom_line(aes(x= date,
+                y= actual,
+                color = "actual")) + 
+  geom_line(aes(x= date,
+                y= forecast,
+                color = "forecast")) 
+```
+```{r}
+last_price <- coredata(tail(Cl(ZUO), 1))
+last_price <- last_price[1]
+
+df_price <- tibble(date = index(tail_spReturns),
+                   actual = 0,
+                   forecast = 0)
+
+df_price$actual[1] <- last_price*exp(df_plot$actual[1])
+df_price$forecast[1] <- last_price*exp(df_plot$forecast[1])
+
+for (i in 2:N_VERIFICATION){
+  df_price$actual[i] <- df_price$actual[i-1]*exp(df_plot$actual[i])
+  df_price$forecast[i] <- df_price$forecast[i-1]*exp(df_plot$forecast[i])
+}
+ggplot(df_price) +
+  geom_line(aes(x = date,
+                y = actual,
+                color = "actual"))+
+  geom_line(aes(x = date,
+                y = forecast,
+                color = "forecast"))
+
+```
+
+```{r}
+#Check if standardised residuals are normal, sged or other distribution?
+a <- residuals(fit, standardize = T)
+df_a <- tibble(date = index(a),
+               std_resid = coredata(a)[,1])
+
+df_a <- df_a %>% mutate(sged = dsged(std_resid, mean = mean(std_resid), sd = sd(std_resid), nu = coef(fit)["shape"], xi = coef(fit)["skew"] ))
+df_a <- df_a %>% mutate(np = dnorm(std_resid, mean = mean(std_resid), sd = sd(std_resid)))
+
+ggplot(df_a) + geom_density(aes(x=std_resid)) + geom_line(aes(x=std_resid, y=np, color = "Normal")) + geom_line(aes(x=std_resid, y=sged, color = "SGED"))
+```

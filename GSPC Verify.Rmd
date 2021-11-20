@@ -1,0 +1,327 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(quantmod)
+library(lattice)
+library(timeSeries)
+library(rugarch)
+library(xts)
+```
+
+```{r}
+getSymbols("^GSPC", from="1950-01-01")
+spReturns = diff(log(Cl(GSPC)))
+spReturns[as.character(head(index(Cl(GSPC)),1))] = 0
+
+windowLength = 500
+foreLength = length(spReturns) - windowLength
+forecasts <- vector(mode="character", length=foreLength)
+```
+
+```{r, eval = FALSE}
+ini = 0
+for (d in ini:foreLength) {
+  # Obtain the S&P500 rolling window for this day
+  spReturnsOffset = spReturns[(1+d):(windowLength+d)]
+  
+  # Fit the ARIMA model
+  final.aic <- Inf
+  final.order <- c(0,0,0)
+  for (p in 0:5) for (q in 0:5) {
+    if ( p == 0 && q == 0) {
+      next
+    }
+    
+    arimaFit = tryCatch( arima(spReturnsOffset, order=c(p, 0, q)),
+                         error=function( err ) {
+                           message(err)
+                           return(FALSE)
+                         },
+                         warning=function( err ) {
+                           # message(err)
+                           return(FALSE)
+                         } )
+    
+    if( !is.logical( arimaFit ) ) {
+      current.aic <- AIC(arimaFit)
+      if (current.aic < final.aic) {
+        final.aic <- current.aic
+        final.order <- c(p, 0, q)
+        # final.arima <- arima(spReturnsOffset, order=final.order)
+        final.arima <- arimaFit
+      }
+    } else {
+      next
+    }
+  }
+  
+  # test for the case we have not achieved a solution  
+  if (final.order[1]==0 && final.order[3]==0) {
+    final.order[1] = 1
+    final.order[3] = 1
+  }
+  
+  
+  # Specify and fit the GARCH model
+  spec = ugarchspec(
+    variance.model=list(garchOrder=c(1,1)),
+    mean.model=list(armaOrder=c(final.order[1], final.order[3]), include.mean=T),
+    distribution.model="sged"
+  )
+  fit = tryCatch(
+    ugarchfit(
+      spec, spReturnsOffset, solver = 'hybrid'
+    ), error=function(e) e, warning=function(w) w
+  )
+  
+  # If the GARCH model does not converge, set the direction to "long" else
+  # choose the correct forecast direction based on the returns prediction
+  # Output the results to the screen and the forecasts vector
+  if(is(fit, "warning")) {
+    forecasts[d+1] = paste(index(spReturnsOffset[windowLength]), 1, sep=",")
+    print(paste(index(spReturnsOffset[windowLength]), 1, sep=","))
+  } else {
+    fore = ugarchforecast(fit, n.ahead=1)
+    ind = fore@forecast$seriesFor
+    forecasts[d+1] = paste(colnames(ind), ifelse(ind[1] < 0, -1, 1), sep=",")
+    print(paste(colnames(ind), ifelse(ind[1] < 0, -1, 1), sep=",")) 
+  }
+}
+write.csv(forecasts, file="data/GSPC Verify.csv", row.names=FALSE)
+```
+
+```{r}
+library(tidyverse)
+forecasts <- read_csv("data/GSPC Verify.csv")
+```
+
+```{python}
+import os
+#os.getcwd()
+#os.path.exists("./data/daily-min-temperatures.csv")
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+import yfinance as yf
+
+fdir = './data/GSPC Verify.csv'
+
+# Load the forecasts
+forecasts = pd.read_csv(fdir, header=None).rename(columns={0: 'Date', 1: 'Signal'})
+forecasts.set_index('Date', inplace=True)
+forecasts.index = pd.to_datetime(forecasts.index)
+
+# load the SP500 df
+df = yf.Ticker('^GSPC').history(period='max')
+df = df[(df.index > '1952-01-03') & (df.index < '2020-12-30')]
+
+# save the strategy signal
+df['Signal'] = forecasts['Signal']
+df.head()
+```
+
+```{python}
+df['LogRets'] = np.log(df['Close'] / df['Close'].shift(1))
+df['StratLogRets'] = df['LogRets'] * df['Signal']
+
+df['BuyHold_Log_Returns'] = df['LogRets'].cumsum()
+df['Strategy_Log_Returns'] = df['StratLogRets'].cumsum()
+
+df['BuyHold_Returns'] = np.exp(df['BuyHold_Log_Returns'])
+df['Strategy_Returns'] = np.exp(df['Strategy_Log_Returns'])
+
+_ = df[['BuyHold_Returns', 'Strategy_Returns']].plot(figsize=(15, 7), logy=True)
+```
+```{python}
+import pandas as pd
+import yfinance as yf
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+class Stock:
+    def __init__(self, ticker, start=None, end=None):
+        self.ticker = ticker
+
+        try:
+            self._ticker = yf.Ticker(self.ticker)
+
+            if not (start or end):
+                self.df = self.df_ = self._ticker.history(period='max')
+
+            else:
+                self.df = self.df_ = self._ticker.history(start=start, end=end)
+
+        except Exception as err:
+            print(err)
+
+    def change_date_range(self, start=None, end=None):
+        """Change the start and end dates of the visible dataframe. The property df_ is kept under the
+        hoods to avoid reloading from yahoo all the time"""
+        start = self.start_date if start is None else start
+        end = self.end_date if end is None else end
+
+        self.df = self.df_[(self.df_.index >= start) & (self.df_.index <= end)]
+
+    def get_value_by_index(self, index, column):
+        """When the date index does not exist, get the following date"""
+        index = pd.to_datetime(index)
+        if index in self.df.index:
+            return self.df.loc[index, column]
+        else:
+            return self.df.loc[self.df.index > index].iloc[0][column]
+
+    def calc_return(self, start=None, end=None):
+        """Calc the simple return of the portfolio within a given date range.
+        If no range is specified, calc it using the full visible period"""
+        start = self.start_date if start is None else start
+        end = self.end_date if end is None else end
+
+        first = self.get_value_by_index(start, 'Close')
+        last = self.get_value_by_index(end, 'Close')
+
+        return (last-first)/first
+
+    def add_signal_strategy(self, df_signal, column_name='Signal'):
+        df_signal.index = pd.to_datetime(df_signal.index)
+        self.df.loc[self.df.index, 'StratSignal'] = df_signal.loc[self.df.index, column_name]
+
+        self.df['StratLogRets'] = self.df['LogRets'] * self.df['StratSignal']
+        self.df.loc[self.df.index, 'CumStratLogRets'] = self.df['StratLogRets'].cumsum()
+        self.df.loc[self.df.index, 'CumStratRets'] = np.exp(self.df['CumStratLogRets'])
+
+    def compare_strategy(self, start=None, end=None, log=False, **kwargs):
+        start = self.start_date if start is None else pd.to_datetime(start)
+        end = self.end_date if end is None else pd.to_datetime(end)
+
+        # create a copy of the period of interest
+        df = self.df.loc[(self.df.index > start) & (self.df.index < end),
+                         ['Close', 'LogRets', 'StratLogRets']].copy()
+
+        df['CumLogRets'] = df['LogRets'].cumsum()
+        df['CumRets'] = 100*(np.exp(df['CumLogRets'])-1)
+
+        df['CumStratLogRets'] = df['StratLogRets'].cumsum()
+        df['CumStratRets'] = 100*(np.exp(df['CumStratLogRets'])-1)
+
+        buy_hold = self.calc_return(start=start, end=end)
+        strategy = np.exp(df.loc[df.index[-1], 'CumStratLogRets'])-1
+
+        pct_pos_returns = (df['LogRets'] > 0).mean() * 100
+        pct_strat_pos_returns = (df['StratLogRets'] > 0).mean() * 100
+
+        print(f'Returns:')
+        print(f'Buy_n_Hold - Return in period: {100*buy_hold:.2f}% - Positive returns: {pct_pos_returns:.2f}%')
+        print(f'Strategy - Return in period: {100*strategy:.2f}% - Positive returns: {pct_strat_pos_returns:.2f}%')
+
+
+        if log:
+            columns = ['CumLogRets', 'CumStratLogRets']
+            rename = {'CumLogRets': 'Buy and Hold Cumulative Log Returns',
+                      'CumStratLogRets': 'Strategy Cumulative Log Returns'}
+        else:
+            columns = ['CumRets', 'CumStratRets']
+            rename = {'CumRets': 'Buy and Hold Returns',
+                      'CumStratRets': 'Strategy Returns'}
+
+        df[columns].rename(columns=rename).plot(**kwargs)
+        return df
+
+    # ************* PROPERTIES ***************
+    @property
+    def is_filled(self): return len(self.df) != 0
+
+    @property
+    def start_date(self): return str(self.df.index[0])
+    @start_date.setter
+    def start_date(self, value): self.change_date_range(start=value)
+
+    @property
+    def end_date(self): return str(self.df.index[-1])
+    @end_date.setter
+    def end_date(self, value): self.change_date_range(end=value)
+
+    # ************* INDICATORS ***************
+    def add_volatility(self, period=10):
+        self.df['volatility'] = self.df['Close'].rolling(period).std() / \
+                                self.df['Close'].rolling(period).mean()
+
+    def add_sma(self, period=10):
+        self.df[f'sma-{period}'] = self.df['Close'].rolling(period).mean()
+
+    def add_ema(self, period=10):
+        self.df[f'ema-{period}'] = self.df['Close'].ewm(span=period).mean()
+
+    def add_log_return(self):
+        self.df.loc[self.df.index, 'LogRets'] = np.log(self.df['Close'] / self.df['Close'].shift(1))
+        self.df.loc[self.df.index[0], 'LogRets'] = 0
+        self.df.loc[self.df.index, 'CumLogRets'] = self.df['LogRets'].cumsum()
+        self.df.loc[self.df.index, 'CumRets'] = np.exp(self.df['CumLogRets'])
+
+    # ************* GRAPHS ***************
+    def plot(self, columns=['Close'], start=None, end=None, figsize=(20,10)):
+
+        # convert the columns to a list
+        columns = [columns] if not isinstance(columns, list) else columns
+
+        start = self.start_date if start is None else start
+        end = self.end_date if end is None else end
+
+        df = self.df[(self.df.index >= start) & (self.df.index <= end)]
+
+        plt.figure(figsize=figsize)
+
+        for column in columns:
+            plt.plot(df.index, df[column], label=column)
+
+        plt.legend()
+
+    def __len__(self):
+        return len(self.df)
+
+    def __repr__(self):
+        if self.is_filled:
+            s = f'Stock: {self.ticker} - start: {self.start_date[:10]} end: {self.end_date[:10]}'
+        else:
+            s = f'Stock {self.ticker} as no history'
+        return s
+```
+
+```{python}
+gspc = Stock('^GSPC')
+gspc.start_date = '2000-01-01'
+gspc.end_date = '2020-12-31'
+gspc.add_log_return()
+gspc.df
+```
+
+
+
+
+
+```{python}
+# Create the windowed dataset
+spReturns = gspc.df['LogRets']
+windowLength = 500
+foreLength = len(spReturns) - windowLength
+
+windowed_ds = []
+for d in range(foreLength-1):
+    windowed_ds.append(spReturns[d:d + windowLength])
+
+# create the forecasts dataframe initialized with zeros
+forecasts = spReturns.iloc[windowLength:].copy() * 0
+
+windowed_ds[0], forecasts, windowed_ds[-1]
+```

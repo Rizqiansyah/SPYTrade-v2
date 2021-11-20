@@ -1,0 +1,135 @@
+---
+title: "SPYTrade v1.1"
+author: "Akbar Rizqiansyah"
+date: "06/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyquant)
+library(tidyverse)
+library(ggplot2)
+library(e1071)
+library(lubridate)
+library(SharpeR)
+library(PortfolioAnalytics)
+library(tbl2xts)
+library(ROI)
+library(plotly)
+library(tseries)
+library(naniar)
+library(broom)
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+ticker <- read_csv("data/SPYticker.csv")
+
+start = '2017-01-01'
+
+
+spy <- tq_get("SPY",
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+all_stock <- tq_get(ticker,
+              from = start,
+              to = today(),
+              get = "stock.prices")
+```
+
+```{r}
+write_csv(all_stock, "data/df0.csv")
+```
+
+```{r}
+all_stock <- read_csv("data/df0.csv")
+```
+
+```{r}
+#Subset data into training and verification
+#verification data from today - 365 days
+
+spy_train <- spy %>% filter(date < today()-days(365))
+all_stock_train <- all_stock %>% filter(date<today()-days(365))
+
+spy_verify <- spy %>% filter(date >= today()-days(365))
+all_stock_verify <- all_stock %>% filter(date >= today()-days(365))
+
+```
+
+
+
+```{r}
+spy1 <- spy_train %>%
+  select("date", "symbol", "close") %>%
+  mutate(r1 = log(close/lag(close, n=1))) %>%
+  filter(date > ymd(start) + days(2))
+
+df1 <- all_stock_train %>%
+  select("date", "symbol", "close") %>%
+  mutate(r1 = log(close/lag(close, n=1))) %>%
+  filter(date > ymd(start) + days(2))
+```
+
+
+```{r}
+p_df1 <- ggplot(df1,
+       aes(x= date,
+           y= r1,
+           group_by= symbol)) + 
+  geom_line()
+
+#ggplotly(p_df1)
+p_df1
+
+ggplot(df1)+
+  geom_histogram(aes(x= r1, group_by= symbol))
+```
+
+```{r}
+xts1 <- tbl_xts(filter(df1, date > ymd(start) + days(2)), 
+                cols_to_xts = r1, 
+                spread_by= symbol)
+```
+
+#Model AAPL
+```{r}
+aapl <- df1 %>% filter(symbol == "AAPL")
+acf_aapl <- acf(aapl$r1)
+
+arma_aapl <- arma(aapl$r1, order = c(2,2))
+
+resid <- arma_aapl$residuals %>% na.omit()
+
+garch_aapl <- garch(resid, order = c(1,1))
+
+```
+```{r}
+summary(garch_aapl)
+```
+
+```{r}
+fitted_aapl <- tibble(fitted = arma_aapl$fitted.values,
+                      resid = arma_aapl$residuals)
+
+fitted_aapl <- bind_cols(aapl, fitted_aapl)
+
+ggplot(fitted_aapl) + 
+  geom_line(aes(x = date,
+                y = r1)) + 
+  geom_line(aes(x = date,
+                y = fitted))
+
+ggplot(fitted_aapl) +
+  geom_line(aes(x = date,
+                y = resid))
+```
+
+
