@@ -1,0 +1,68 @@
+17/11/2021
+Simple portfolio analysis, check the impact of portfolio to VaR. Accuracy, value increase? decrease?
+- Simulate return = mu + epsilon. Multiply the simulated return by the portfolio weights. Get the VaR afterward.
+Expected shortfall analysis
+Observations:
+- In sample VaR exceedance seems to be close to the expected exceedance (5%). 
+- Some portfolio have 6% exceedance although hard to tell if this is just noise or a result of poor model selection (especially the standardised residuals)
+- Should look into negatively correlated stocks, as MSFT and AMZN seems to be positively correlated and so they don't really minimise the volatility
+- Overall GARCH-Copula model seems to be fairly good for in sample prediction. Need to test out of sample tomorrow
+
+18/11/2021
+Done:
+Fitted LSTM on the CDF of return, then use the output to get a secondary residuals which was then fitted with GARCH
+Initial Ideas:
+Machine learning for return estimation + GARCH-Copula for volatility and VaR modelling 
+- ARIMA-eGARCH-tCopula-LSTM model:
+- Use LSTM. Instead of minmax scaler, convert CDF (either the return, standardised residuals or residuals?)
+- If convert CDF of return, then maybe do a regular ARIMA-GARCH-Copula model first to get CDF from randomly simulated dataset
+- then use the CDF as input to the LSTM. Use the output of the LSTM (in-sample) and calculate residuals. Then model GARCH-Copula
+- and compare with regular ARIMA-GARCH-Copula model. Maybe even repeat the LSTM layer after the first LSTM estimation.
+- Maybe test other GARCH model too?
+Observations:
+Seems that the LSTM standardised residuals fared worse then the original standardised residuals.
+Also need to look into properly dividing the dataset into training and test dataset.
+Right now the test dataset is splitting what is suppose to be the whole training data.
+So its a bit unfair to the LSTM model since it has only 2/3 of the data to train on.
+Also this produces NaN in the middle of the data set, making GARCH estimation a bit problematic.
+Right now the treatment is simply to remove NaN
+
+19/11/2021
+Out of sample observations
+Vary sample size. Maybe do 6 months for out of sample + 18 months for in sample training?
+
+
+Immediate:
+Out of sample forecasting and check
+Complex portfolio (>3 assets)
+Rolling out of sample forecasting (A lot harder, maybe do after portfolio)
+
+
+Ideas:
+How to take into account weekends
+using parameters like IV and momentum
+Quantamental analysis
+
+Multi path forecasting and using data assimilation (?) to combine the multi path models
+
+Using time varying copula model
+
+For metrics to see how well an asset/portfolio performs:
+- VaR to calculate value at risk
+- expected shortfall
+- loss porbability, i.e. P(return < 0)
+- Expected >VaR, E(return>VaR)
+- Expected positive vs negative return, E(return>0) vs E(return<0)
+
+Using standardised residual distribution as target rather than minimising error when fitting coefficients
+- e.g. for a simple ARMA-GARCH model with SGED. When fitting the ARMA, GARCH and SGED parameter, pick parameters that ensure that the standardised
+residual distribution fits according to the SGED distribution. Can be tested using KS, Chi2GOF test, etc.
+- Alternatively, may be a good idea to set the objective as the sd parameter of the SGED. e.g., find parameter coefficients such that the sd is minimised,
+while ensuring that the probability distributions are not violated.
+- This is a complicated task. Even with a simple ARMA(1,1)-GARCH(1,1), there are 6 coefficients plus the 4 coefficients from the sged (3 if sd is the objective)
+- Total of 10 (or 9) parameters to estimate.
+- May need to rewrite the question mathematically. pehaps there is a better analytical equation/solution to this
+
+
+Final goal:
+Create strategy based on the models of volatility and mean
