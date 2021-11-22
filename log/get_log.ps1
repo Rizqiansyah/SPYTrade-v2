@@ -1,0 +1,1 @@
+Get-Content "parallel-log.txt" -Wait
