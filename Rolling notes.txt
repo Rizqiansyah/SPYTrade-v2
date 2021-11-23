@@ -44,7 +44,10 @@ Next step:
 if the assumed standardised residual is a good fit. Else need to seek another standardised residual distribution.
 - When fitting GARCH, needs to be a lot smarter than just checking all the possible values. e.g. see the ACF, PACF of standardised residuals, etc.
 - Need to code rolling out of sample forecast, i.e. need to do repeated model fitting. This will be very expensive. To verify if the actual VaR distribution invariant of time. 
-
+EoD note:
+- Need to remove na at the end (N_VERIFICATION length) of all_stock_close data, since they're critical for verification
+- Alternatively remove stocks that have NA along the N_VERIFICATION dats
+- Stocks have "." in their name, which confuses line 755 onward
 
 
 Immediate:

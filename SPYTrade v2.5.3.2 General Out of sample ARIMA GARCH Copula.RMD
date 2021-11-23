@@ -29,11 +29,13 @@ library(tidyverse)
 library(tidyquant)
 library(visdat)
 library(naniar)
+library(imputeTS)
+library(plotly)
 ```
 
 # 1.0 Data tidying
 Download the data
-FOR NOW: remove stocks with any missing values
+FOR NOW: Missing close values are imputed via linear interpolation
 ```{r, warning = FALSE, echo = FALSE}
 #Download data
 ticker = read_csv("data/combined_ticker.csv")
@@ -49,43 +51,78 @@ all_stock_original <- tq_get(ticker,
               from = "2020-10-01",
               to = "2021-11-01",
               get = "stock.prices") %>%
-  select(symbol, date, close) %>%
-  mutate(lret = c(0, diff(log(close))))
+  select(symbol, date, close) #%>%
+  # mutate(lret = c(0, diff(log(close))))
 
 write_csv(all_stock_original, "data/all_stock_original.csv")
 all_stock_original <- read_csv("data/all_stock_original.csv")
 
 #Turn all first days returns to 0
-first_day <- all_stock_original %>%
-  group_by(symbol) %>%
-  summarise(date = min(date)) %>%
-  left_join(all_stock_original, by = c("symbol" = "symbol", "date" = "date")) %>%
-  mutate(lret = 0)
-
-all_stock_original <- all_stock_original %>% 
-  anti_join(first_day, by = c("symbol" = "symbol", "date" = "date")) %>%
-  bind_rows(first_day) %>%
-  arrange(date)
+# first_day <- all_stock_original %>%
+#   group_by(symbol) %>%
+#   summarise(date = min(date)) %>%
+#   left_join(all_stock_original, by = c("symbol" = "symbol", "date" = "date")) %>%
+#   mutate(lret = 0)
+# 
+# all_stock_original <- all_stock_original %>% 
+#   anti_join(first_day, by = c("symbol" = "symbol", "date" = "date")) %>%
+#   bind_rows(first_day) %>%
+#   arrange(date)
 
 #Delete objects
-rm(first_day)
+# rm(first_day)
 ```
 
 Split the data into training and verification data
 2/3 training, 1/3 training
-FOR NOW: remove stocks with any missing values
+FOR NOW: Missing close values are imputed via linear interpolation
 ```{r}
 #Split the data into its individual symbols
-all_stock_lret <- pivot_wider(all_stock_original,
-                              id_cols = date,
-                              names_from = symbol,
-                              values_from = lret,
-                              names_glue = "{symbol}.lret")
 all_stock_close <- pivot_wider(all_stock_original,
                                id_cols = date,
                                names_from = symbol,
                                values_from = close,
-                               names_glue = "{symbol}.close")
+                               names_glue = "{symbol}.close") %>%
+  arrange(date)
+#NOTE: Need to deal with NA at the start and end of the series.Their interpolation are the last point
+all_stock_close <- na_interpolation(all_stock_close)
+
+#Calculate return
+df_1 <- all_stock_close %>%
+  pivot_longer(cols = -date,
+               names_to = "symbol",
+               values_to = "close") %>%
+  mutate(symbol = gsub(".close", "", symbol)) %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(lret = c(0, diff(log(close))))
+
+#Turn all first days returns to 0
+first_day <- df_1 %>%
+  group_by(symbol) %>%
+  summarise(date = min(date)) %>%
+  left_join(df_1, by = c("symbol" = "symbol", "date" = "date")) %>%
+  mutate(lret = 0)
+
+df_1 <- df_1 %>%
+  anti_join(first_day, by = c("symbol" = "symbol", "date" = "date")) %>%
+  bind_rows(first_day) %>%
+  arrange(date)
+  
+all_stock_lret <-  pivot_wider(df_1,
+                                 id_cols = date,
+                                 names_from = symbol,
+                                 values_from = lret,
+                                 names_glue = "{symbol}.lret")
+p <- ggplot(all_stock_lret %>%
+         pivot_longer(cols = -date,
+               names_to = "symbol",
+               values_to = "lret") %>%
+         mutate(symbol = gsub(".lret", "", symbol))) +
+  geom_line(aes(x=date, y= lret, group = symbol)) +
+  ggtitle("Daily log return of stocks. Some values were imputed")
+p
+
 
 all_stock <- all_stock_lret %>% 
   full_join(all_stock_close, by ="date")
@@ -116,13 +153,13 @@ all_stock_verification <- all_stock %>%
   tail(N_VERIFICATION)
 
 #Delete objects
-rm(all_stock_lret, all_stock_close)
+rm(all_stock_lret, all_stock_close, p, df_1)
 ```
 
 Check for any missing data
 ```{r}
-vis_miss(all_stock %>% select(ends_with(".lret")))
-vis_miss(all_stock %>% select(ends_with(".close")))
+# vis_miss(all_stock %>% select(ends_with(".lret")))
+# vis_miss(all_stock %>% select(ends_with(".close")))
 ```
 
 
@@ -130,8 +167,8 @@ See correlation
 See both Pearson's and Spearman's (Assuming no normal dependencies)
 ```{r}
 library(ggcorrplot)
-ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "pearson"), lab=TRUE)
-ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "spearman"), lab=TRUE)
+# ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "pearson"), lab=TRUE)
+# ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "spearman"), lab=TRUE)
 ```
 Let's stick with AMZN and MSFT first, then generalise if possible
 ```{r}
