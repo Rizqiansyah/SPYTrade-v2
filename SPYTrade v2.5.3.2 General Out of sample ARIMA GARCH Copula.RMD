@@ -36,31 +36,33 @@ Download the data
 FOR NOW: remove stocks with any missing values
 ```{r, warning = FALSE, echo = FALSE}
 #Download data
-ticker = read_csv("data/SPYticker.csv")
+ticker = read_csv("data/combined_ticker.csv")
 #Select only X% of ticker
 set.seed(100)
-N_PROP = 0.25
+N_PROP = 1
 ticker <- ticker %>%
   mutate(selected = rbinom(nrow(ticker), size = 1, prob = N_PROP)) %>%
   filter(selected == 1)
 ticker = ticker$symbol
 
-all_stock <- tq_get(ticker,
+all_stock_original <- tq_get(ticker,
               from = "2020-10-01",
               to = "2021-11-01",
               get = "stock.prices") %>%
   select(symbol, date, close) %>%
   mutate(lret = c(0, diff(log(close))))
 
+write_csv(all_stock_original, "data/all_stock_original.csv")
+all_stock_original <- read_csv("data/all_stock_original.csv")
 
 #Turn all first days returns to 0
-first_day <- all_stock %>%
+first_day <- all_stock_original %>%
   group_by(symbol) %>%
   summarise(date = min(date)) %>%
-  left_join(all_stock, by = c("symbol" = "symbol", "date" = "date")) %>%
+  left_join(all_stock_original, by = c("symbol" = "symbol", "date" = "date")) %>%
   mutate(lret = 0)
 
-all_stock <- all_stock %>% 
+all_stock_original <- all_stock_original %>% 
   anti_join(first_day, by = c("symbol" = "symbol", "date" = "date")) %>%
   bind_rows(first_day) %>%
   arrange(date)
@@ -74,12 +76,12 @@ Split the data into training and verification data
 FOR NOW: remove stocks with any missing values
 ```{r}
 #Split the data into its individual symbols
-all_stock_lret <- pivot_wider(all_stock,
+all_stock_lret <- pivot_wider(all_stock_original,
                               id_cols = date,
                               names_from = symbol,
                               values_from = lret,
                               names_glue = "{symbol}.lret")
-all_stock_close <- pivot_wider(all_stock,
+all_stock_close <- pivot_wider(all_stock_original,
                                id_cols = date,
                                names_from = symbol,
                                values_from = close,
@@ -176,8 +178,8 @@ library(doParallel)
 ERR_DIST = "std" #norm, snorm, std, sstd, ged, sged
 MAX_ARIMA_P = 5
 MAX_ARIMA_Q = 5
-MAX_GARCH_P = 2
-MAX_GARCH_Q = 2
+MAX_GARCH_P = 1
+MAX_GARCH_Q = 1
 
 cores=detectCores()
 cl <- makeCluster(cores[1]-1, outfile="log/parallel-log.txt")
@@ -202,8 +204,6 @@ loutput <- foreach(i = 1:length(ticker), .combine = "rbind") %dopar% {
                              q=0,
                              AIC = Inf)
   
-  
-
   for (p in 0:MAX_ARIMA_P) for (q in 0:MAX_ARIMA_Q) {
     if ( p == 0 && q == 0) {
       next
@@ -248,20 +248,22 @@ loutput <- foreach(i = 1:length(ticker), .combine = "rbind") %dopar% {
     
     for (p in 1:MAX_GARCH_P) for (q in 1:MAX_GARCH_Q){
       print(paste(as.character(Sys.time()), ": ",
-                  "Stock =", current.symbol, 
-                  "ARIMA p =", ARIMA_p,
-                  "ARIMA d =", ARIMA_d,
-                  "ARIMA q =", ARIMA_q,
-                  "GARCH p =", p,
-                  "GARCH q =", q))
+                  current.symbol, 
+                  "(", ARIMA_p,
+                  ",", ARIMA_d,
+                  ",", ARIMA_q,
+                  ") (", p,
+                  ",", q, ")",
+                  sep = ""))
       spec = ugarchspec(
         variance.model=list(model ="eGARCH",
                             #submodel = "TGARCH",
                             garchOrder=c(p,q)),
         mean.model=list(armaOrder=c(ARIMA_p,
                                     ARIMA_q),
-                        include.mean=T,
-                        archm = TRUE),
+                        include.mean=T #,
+                        #archm = TRUE),
+                        ),
         distribution.model= ERR_DIST
       )
       garchFit = tryCatch(
@@ -483,20 +485,20 @@ if(ERR_DIST == "sged"){
 }
   
 library(plotly)
-ggplotly(ggplot(df_fitted_pdf) +
-  geom_density(aes(x=std_resid, color = "Actual std resid")) +
-  geom_line(aes(x=std_resid, y=norm_pdf, color = "Theoretical Normal"))+
-  geom_line(aes(x=std_resid, y=std_err_pdf, color = paste("Theoretical", ERR_DIST)))+
-  facet_wrap(~symbol)+
-  ggtitle("Standardised Residual, theoretical distribution vs actual"))
+# ggplotly(ggplot(df_fitted_pdf) +
+#   geom_density(aes(x=std_resid, color = "Actual std resid")) +
+#   geom_line(aes(x=std_resid, y=norm_pdf, color = "Theoretical Normal"))+
+#   geom_line(aes(x=std_resid, y=std_err_pdf, color = paste("Theoretical", ERR_DIST)))+
+#   facet_wrap(~symbol)+
+#   ggtitle("Standardised Residual, theoretical distribution vs actual"))
 ```
 Using t-distribution for standardised residuals. seems that AMZN fits pretty well except for some end tail, and MSFT fits normal better for this case
 
 
 ```{r}
-ggplot(df_fitted_pdf) +
-  stat_ecdf(aes(x=std_resid, color = "actual ecdf")) +
-  facet_wrap(~symbol)
+# ggplot(df_fitted_pdf) +
+#   stat_ecdf(aes(x=std_resid, color = "actual ecdf")) +
+#   facet_wrap(~symbol)
 ```
 
 
@@ -698,17 +700,17 @@ df_VaR_long <- df_VaR %>%
            into = c("symbol", "label"),
            sep = "\\.")
 
-ggplot(df_VaR_long) +
-  geom_line(aes(x = date, y = value, color = label)) +
-  facet_wrap(~ symbol, scales = "free_y")
+# ggplot(df_VaR_long) +
+#   geom_line(aes(x = date, y = value, color = label)) +
+#   facet_wrap(~ symbol, scales = "free_y")
 
 rm(df_1, df_2, df_3, uRandom, loutput)
 ```
 
 See the distribution of stocks in terms of its probability at the 25%, 50%, 75% and 100% (end) point
 ```{r}
-interested_point = c(0.25, 0.50, 0.75, 1.00)
-interested_date = df_VaR$date[round(N_VERIFICATION*interested_point)]
+interested_point = c(N_VERIFICATION:1)
+interested_date = df_VaR$date[N_VERIFICATION-interested_point+1]
 
 df_VaR_performance <- tibble(symbol = ticker)
 
@@ -745,16 +747,37 @@ df_VaR_performance <- df_VaR_performance %>%
 
 ggplot(df_VaR_performance) +
   geom_histogram(aes(x = probability)) +
+  geom_vline(xintercept = 0.05)+
   facet_wrap(~date)
 
 ggplot(df_VaR_performance) +
   geom_density(aes(x = probability)) +
+  geom_vline(xintercept = 0.05) + 
   facet_wrap(~date)
+
+df_VaR_performance %>% 
+  mutate(exceed_VaR = probability<0.05) %>%
+  group_by(date) %>%
+  summarise(exceed_num = sum(exceed_VaR),
+            exceed_prop = sum(exceed_VaR)/length(ticker),
+            exceed_expected = 0.05*length(ticker))
 
 rm(df_1, df_2)
 ```
 
+Animate the density throughout time
+```{r}
+library(gifski)
+library(transformr)
+library(gganimate)
 
+p <- ggplot(df_VaR_performance) +
+  geom_density(aes(x = probability)) +
+  geom_vline(xintercept = 0.05)  +
+  labs(title = 'Date: {frame_time}')+
+  transition_time(date)
+animate(p)
+```
 
 
 
