@@ -31,6 +31,21 @@ Right now the treatment is simply to remove NaN
 Out of sample observations
 Vary sample size. Maybe do 6 months for out of sample + 18 months for in sample training?
 
+23/11/2021
+Out of sample forecasting
+Check VaR accuracy against actual along 4 points in time.
+Observations:
+The closing price, given the VaR distribution should have a uniform distribution. But this is not the case.
+Need to do rolling sample forecast to ascertain this. But this is tricky and expensive as the GARCH model takes a long time to process.
+I think a large part of why the VaR distribution is off is because the standardised residuals are not representative of the fitted standardised residual.
+There is also possibly remnant of autocorrelation in the standardised residuals, maybe even heteroskedasticity.
+Next step:
+- Make the ARIMA-GARCH modelling more robust. Include analysis of ACF, PACF, Autocorrelation, stationarity, white noise, etc, and check
+if the assumed standardised residual is a good fit. Else need to seek another standardised residual distribution.
+- When fitting GARCH, needs to be a lot smarter than just checking all the possible values. e.g. see the ACF, PACF of standardised residuals, etc.
+- Need to code rolling out of sample forecast, i.e. need to do repeated model fitting. This will be very expensive. To verify if the actual VaR distribution invariant of time. 
+
+
 
 Immediate:
 Out of sample forecasting and check
