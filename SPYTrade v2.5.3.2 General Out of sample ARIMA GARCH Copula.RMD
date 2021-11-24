@@ -48,7 +48,7 @@ ticker <- ticker %>%
 ticker = ticker$symbol
 
 all_stock_original <- tq_get(ticker,
-              from = "2020-10-01",
+              from = "2019-10-01",
               to = "2021-11-01",
               get = "stock.prices") %>%
   select(symbol, date, close) #%>%
@@ -140,7 +140,7 @@ ticker <- unique(ticker$symbol)
 
 
 #Split verification and training data
-N_VERIFICATION = 10
+N_VERIFICATION = 100
 N_TRAIN = nrow(all_stock_lret) - N_VERIFICATION
 
 # N_TRAIN = ceiling(nrow(all_stock_lret)*2/3)
@@ -728,14 +728,14 @@ df_VaR <- df_garch_forecast %>%
   bind_cols(loutput)
 
 #For plotting
-df_VaR_long <- df_VaR %>%
-  select(-ends_with(".random_price")) %>%
-  pivot_longer(cols = -date,
-               names_to = "symbol",
-               values_to = "value") %>%
-  separate(col = symbol,
-           into = c("symbol", "label"),
-           sep = "\\.")
+# df_VaR_long <- df_VaR %>%
+#   select(-ends_with(".random_price")) %>%
+#   pivot_longer(cols = -date,
+#                names_to = "symbol",
+#                values_to = "value") %>%
+#   separate(col = symbol,
+#            into = c("symbol", "label"),
+#            sep = "\\.")
 
 # ggplot(df_VaR_long) +
 #   geom_line(aes(x = date, y = value, color = label)) +
@@ -759,8 +759,15 @@ df_2 <- df_1 %>%
   select(ends_with(".random_price"), ends_with(".close")) %>%
   pivot_longer(cols = everything(), names_to = "symbol", values_to = "value") %>%
   separate(col = symbol,
-           into = c("symbol", "label"),
-           sep = "\\.") %>%
+           into = c("symbol", "label1", "label2"),
+           sep = "\\.",
+           extra = "merge",
+           fill = "left") %>%
+  mutate(label1 = gsub("random_price", NA, label1)) %>%
+  mutate(label1 = gsub("close", NA, label1)) %>%
+  unite("symbol", symbol:label1, sep = ".", remove = TRUE, na.rm = TRUE) %>%
+  mutate(label = label2) %>%
+  select(-label2) %>%
   pivot_wider(id_cols = symbol,
               names_from = label,
               values_from = value) %>%
@@ -792,14 +799,19 @@ ggplot(df_VaR_performance) +
   geom_vline(xintercept = 0.05) + 
   facet_wrap(~date)
 
-df_VaR_performance %>% 
+df_3 <- df_VaR_performance %>% 
   mutate(exceed_VaR = probability<0.05) %>%
   group_by(date) %>%
   summarise(exceed_num = sum(exceed_VaR),
             exceed_prop = sum(exceed_VaR)/length(ticker),
             exceed_expected = 0.05*length(ticker))
+df_3
 
-rm(df_1, df_2)
+ggplot(df_3) +
+  geom_line(aes(x=date, y= exceed_prop)) +
+  geom_hline(yintercept = 0.05)
+
+rm(df_1, df_2, df3)
 ```
 
 Animate the density throughout time
@@ -809,14 +821,31 @@ library(transformr)
 library(gganimate)
 
 p <- ggplot(df_VaR_performance) +
-  geom_density(aes(x = probability)) +
+  geom_density(aes(x = probability, color = date)) +
   geom_vline(xintercept = 0.05)  +
   labs(title = 'Date: {frame_time}')+
   transition_time(date)
-animate(p)
+p <- animate(p, 
+        fps = 10,
+        duration = 60, 
+        end_pause = 3)
+anim_save("gif/SPYTrade v2.5.3.2 - Density of price throughout verification period- US UK DE AU JP.gif", p)
+p
 ```
 
-
+```{r}
+p2 <- ggplot(df_VaR_performance) +
+  geom_histogram(aes(x = probability, fill = date)) +
+  geom_vline(xintercept = 0.05)+
+  labs(title = 'Date: {frame_time}')+
+  transition_time(date)
+p2 <- animate(p2, 
+        fps = 10,
+        duration = 60, 
+        end_pause = 3)
+anim_save("gif/SPYTrade v2.5.3.2 - Histogram of price throughout verification period- US UK DE AU JP.gif", p2)
+p2
+```
 
 
 
