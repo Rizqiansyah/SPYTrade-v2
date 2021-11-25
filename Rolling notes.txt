@@ -49,12 +49,22 @@ EoD note:
 - Alternatively remove stocks that have NA along the N_VERIFICATION dats
 - Stocks have "." in their name, which confuses line 755 onward
 
+24/11/2021:
+ADF test keeps rejecting stationarity (unit root) of the standardised residuals
+Added days of the week as dummy variable and external regressors
+Also, found interesting effect where if the return is multiplied by 100, the standardised residual seems to fit better? Maybe just a fluke, but perhaps there is a multiplier X where
+it could change the standardise residual to well behaving. 
+See the function below
+as5 <- fn_fit_arima_garch(all_stock, "AAPL", N_VERIFICATION, arima_p = 3, arima_q = 3, garch_p = 6, garch_q = 6,
+                          external_x = as.matrix(select(all_stock_train, "Tue", "Wed", "Thu", "Fri")), err_dist = "norm")
+plot(residuals(as5, standardize = T)
+
+
+
 
 Immediate:
-Out of sample forecasting and check
 Complex portfolio (>3 assets)
 Rolling out of sample forecasting (A lot harder, maybe do after portfolio)
-
 
 Ideas:
 How to take into account weekends

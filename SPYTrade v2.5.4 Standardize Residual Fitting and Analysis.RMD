@@ -6,13 +6,12 @@ output: html_document
 ---
 
 Objective:
-Do proper out of sample forecasting (5 days), see how the model performs along the 5 days.
-Also make the whole dataframe tidier, make it so it can handle more than 2 assets.
-Actively delete unused objects and variables to save on memory.
-Extension: look into multi path forecasting + data assimilation to combine the different estimates.
+Develop a more robust system to select ARIMA and GARCH lag
+With the main objective of ensuring that the standardised residuals are well behaving
 
-Difference to v2.5.2:
-No LSTM estimates at the end
+Difference to v2.5.3.2:
+This code only looks at a couple of stocks to simplify analysis. Will generalise into the other stocks in later versions
+Returns are multiplied by 100
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -38,14 +37,18 @@ Download the data
 FOR NOW: Missing close values are imputed via linear interpolation
 ```{r, warning = FALSE, echo = FALSE}
 #Download data
-ticker = read_csv("data/combined_ticker.csv")
-#Select only X% of ticker
-set.seed(100)
-N_PROP = 1
-ticker <- ticker %>%
-  mutate(selected = rbinom(nrow(ticker), size = 1, prob = N_PROP)) %>%
-  filter(selected == 1)
-ticker = ticker$symbol
+# ticker = read_csv("data/combined_ticker.csv")
+# #Select only X% of ticker
+# set.seed(100)
+# N_PROP = 1
+# ticker <- ticker %>%
+#   mutate(selected = rbinom(nrow(ticker), size = 1, prob = N_PROP)) %>%
+#   filter(selected == 1)
+# ticker = ticker$symbol
+
+ticker = c("AAPL",
+           "AMZN",
+           "MSFT")
 
 all_stock_original <- tq_get(ticker,
               from = "2020-10-01",
@@ -54,8 +57,8 @@ all_stock_original <- tq_get(ticker,
   select(symbol, date, close) #%>%
   # mutate(lret = c(0, diff(log(close))))
 
-write_csv(all_stock_original, "data/all_stock_original.csv")
-all_stock_original <- read_csv("data/all_stock_original.csv")
+# write_csv(all_stock_original, "data/all_stock_original.csv")
+# all_stock_original <- read_csv("data/all_stock_original.csv")
 
 #Turn all first days returns to 0
 # first_day <- all_stock_original %>%
@@ -74,9 +77,13 @@ all_stock_original <- read_csv("data/all_stock_original.csv")
 ```
 
 Split the data into training and verification data
-2/3 training, 1/3 training
-FOR NOW: Missing close values are imputed via linear interpolation
+FOR NOW: Missing close values are either deleted or interpolated (Select below)
 ```{r}
+#Select TRUE to interpolate NA. Otherwise NA are omitted
+#Usually if the market spans the world or has a lot of assets,it would be close to impossible to omit NA.
+#Otherwise better to omit NA. Omitting NA means removing the asset, not the date.
+NA_INTERPOLATE = FALSE 
+
 #Split the data into its individual symbols
 all_stock_close <- pivot_wider(all_stock_original,
                                id_cols = date,
@@ -84,8 +91,13 @@ all_stock_close <- pivot_wider(all_stock_original,
                                values_from = close,
                                names_glue = "{symbol}.close") %>%
   arrange(date)
-#NOTE: Need to deal with NA at the start and end of the series.Their interpolation are the last point
-all_stock_close <- na_interpolation(all_stock_close)
+
+if (NA_INTERPOLATE){
+  #NOTE: Need to deal with NA at the start and end of the series.Their interpolation are the last point
+  all_stock_close <- na_interpolation(all_stock_close)
+} else{
+  all_stock_close <- all_stock_close %>% select_if(~ !any(is.na(.)))
+}
 
 #Calculate return
 df_1 <- all_stock_close %>%
@@ -95,7 +107,8 @@ df_1 <- all_stock_close %>%
   mutate(symbol = gsub(".close", "", symbol)) %>%
   group_by(symbol) %>%
   arrange(date) %>%
-  mutate(lret = c(0, diff(log(close))))
+  mutate(lret = c(0, diff(log(close))*100))
+
 
 #Turn all first days returns to 0
 first_day <- df_1 %>%
@@ -125,7 +138,13 @@ p
 
 
 all_stock <- all_stock_lret %>% 
-  full_join(all_stock_close, by ="date")
+  full_join(all_stock_close, by ="date") %>%
+  # Add day dummy variable 
+  mutate(day = wday(date, label = TRUE)) %>%
+  mutate(dummy = 1) %>%
+  pivot_wider(id_cols = -day, names_from = day, values_from = dummy) %>% 
+  replace(is.na(.),0) %>%
+  select(-"Mon")
 
 #FOR NOW: remove stocks with any missing values
 all_stock <- all_stock %>% select_if(~ !any(is.na(.)))
@@ -158,8 +177,8 @@ rm(all_stock_lret, all_stock_close, p, df_1)
 
 Check for any missing data
 ```{r}
-# vis_miss(all_stock %>% select(ends_with(".lret")))
-# vis_miss(all_stock %>% select(ends_with(".close")))
+vis_miss(all_stock %>% select(ends_with(".lret")))
+vis_miss(all_stock %>% select(ends_with(".close")))
 ```
 
 
@@ -167,20 +186,20 @@ See correlation
 See both Pearson's and Spearman's (Assuming no normal dependencies)
 ```{r}
 library(ggcorrplot)
-# ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "pearson"), lab=TRUE)
-# ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "spearman"), lab=TRUE)
+ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "pearson"), lab=TRUE)
+ggcorrplot(cor(all_stock%>%select(ends_with(".lret")), method = "spearman"), lab=TRUE)
 ```
-Let's stick with AMZN and MSFT first, then generalise if possible
+
 ```{r}
 #Select stocks of interest. Else can leave as select_ticker = ticker
 select_ticker = ticker 
 
 all_stock <- all_stock %>%
-  select(date, starts_with(select_ticker))
+  select(date, starts_with(select_ticker), Tue, Wed, Thu, Fri)
 all_stock_train <- all_stock_train %>%
-  select(date, starts_with(select_ticker))
+  select(date, starts_with(select_ticker), Tue, Wed, Thu, Fri)
 all_stock_verification <- all_stock_verification %>%
-  select(date, starts_with(select_ticker))
+  select(date, starts_with(select_ticker), Tue, Wed, Thu, Fri)
 
 ticker = select_ticker
 ```
@@ -201,7 +220,251 @@ best_fit <- tibble(symbol = ticker,
   nest(order = c(ARIMA_p, ARIMA_d, ARIMA_q, GARCH_p, GARCH_q))
 ```
 
+function to Fit ARIMA-GARCH model
+```{r}
+fn_fit_arima_garch <- function(data, 
+                               symbol, 
+                               n_verification,
+                               garch_model = "eGARCH",
+                               err_dist = "sged",
+                               arima_p = 1,
+                               arima_d = 0,
+                               arima_q = 1,
+                               garch_p = 1,
+                               garch_q = 1,
+                               external_x = NULL){
+  #IMPORTANT:
+  #external_x must be in matrix form (use as.matrix())
+  
+  #Convert to XTS object to maintain date consistencies
+  varname <- paste(symbol, ".lret", sep ="") 
+  df_xts <- tk_xts(data,
+                   select = (!!as.name(varname)),
+                   date_var = "date")
+  #Fit
+  spec = ugarchspec(
+        variance.model=list(model = garch_model,
+                            #submodel = "TGARCH",
+                            garchOrder=c(garch_p, garch_q)),
+        mean.model=list(armaOrder=c(arima_p,
+                                    arima_q),
+                        include.mean=T,
+                        #archm = TRUE,
+                        external.regressors = external_x
+                        ),
+        distribution.model= err_dist
+      )
+  garchFit = tryCatch(
+        ugarchfit(
+          spec, df_xts, solver = 'hybrid', out.sample = n_verification
+        ),
+        error=function( err ) {
+                             message(paste(symbol, err))
+                             return(FALSE)
+                           },
+        warning=function( err ) {
+                             message(paste(symbol, err))
+                             return(FALSE)
+                           } )
+  return(garchFit)
+}
+```
 
+Note:
+ARCH LM, Weighted Ljung-Box: H0: No autocorrelation up to lag n, H1: Autocorrelation present up to lag n
+Nyblom Stability: H0: coefficient is constant throughout time, H1: coefficient is changing throughout time
+
+
+ADF test: H0: Stationary (no unit root), H1: non-stationary (unit root not present/outside of circ)
+KPSS: H0: non-stationary, H1: stationary
+NOTE ADF and KPSS H0 are opposite!
+
+Adj. Pearson GoF test: H0: data fits specified distribution, H1: data does not fit specified distribution
+KS test: H0: data fits specified distribution, H1: data does not fit specified distribution
+
+
+Assess different garch model with different distribution
+See if any performs better, and how it performs better
+```{r}
+library(timetk) #Convert tibble to xts object
+library(foreach) #Parallel for loops
+library(doParallel)
+
+ERR_DIST = "sged" #norm, snorm, std, sstd, ged, sged
+MAX_ARIMA_P = 5
+MAX_ARIMA_Q = 5
+MAX_GARCH_P = 1
+MAX_GARCH_Q = 1
+
+model <- fn_fit_arima_garch(data = all_stock,
+                   symbol = "AAPL",
+                   n_verification = N_VERIFICATION,
+                   garch_model = "eGARCH",
+                   err_dist = ERR_DIST,
+                   arima_p = 5,
+                   arima_q = 5,
+                   garch_p = 5,
+                   garch_q = 5,
+                   external_x = as.matrix(select(all_stock, Tue, Wed, Thu, Fri)))
+
+#Construct QQ plot of the residual
+model.resid <- residuals(model, standardize = T)
+acf(model.resid)
+pacf(model.resid)
+
+model.resid.mean <- 0
+model.resid.sd <- 1
+model.resid.shape <- coef(model)["shape"]
+model.resid.skew <- coef(model)["skew"]
+
+model.rank <- tibble(actual = model.resid) %>%
+  arrange(actual) %>%
+  mutate(quantile = c(1:nrow(model.resid))/nrow(model.resid))
+
+if (ERR_DIST == "sstd"){
+model.rank <- model.rank %>%
+  mutate(theoretical = qsstd(p = quantile,
+                             mean = model.resid.mean,
+                             sd = model.resid.sd,
+                             nu = model.resid.shape,
+                             xi = model.resid.skew))
+} else if (ERR_DIST == "sged") {
+model.rank <- model.rank %>%
+  mutate(theoretical = qsged(p = quantile,
+                             mean = model.resid.mean,
+                             sd = model.resid.sd,
+                             nu = model.resid.shape,
+                             xi = model.resid.skew))
+}
+
+
+
+ggplot(model.rank) +
+  geom_point(aes(x=theoretical, y = actual)) +
+  geom_abline(slope = 1, intercept = 0)
+
+
+#Calculate error from straight line
+df_1 <- model.rank %>% 
+  mutate(err_sq = (actual - theoretical)^2) %>%
+  head(nrow(model.rank)-1) %>%
+  summarise(SSE = sum(err_sq),
+            MSE = sum(err_sq)/nrow(model.rank),
+            RMSE = sqrt(sum(err_sq)/nrow(model.rank)))
+
+#Weighted SSE. Weight is 
+#1 for all abs(theoretical) <= 1, 
+#log(abs(theoretical))+1 for all abs(theoretical) > 1
+#The code below use indicator function
+df_2 <- model.rank %>% 
+  mutate(err_sq = (actual - theoretical)^2 * (1 + log(abs(theoretical)) * (abs(theoretical)>1))) %>%
+  head(nrow(model.rank)-1) %>%
+  summarise(SSE = sum(err_sq),
+            MSE = sum(err_sq)/nrow(model.rank),
+            RMSE = sqrt(sum(err_sq)/nrow(model.rank)))
+
+bind_cols(type = c("linear", "log weighted"), bind_rows(df_1, df_2))
+
+```
+
+
+```{r}
+alpha = 0.05 #Significance level
+
+best_fit <- tibble(ARIMA_p = 1,
+       ARIMA_d = 0,
+       ARIMA_q = 1,
+       GARCH_p = 1,
+       GARCH_q = 1,
+       AIC = Inf,
+       BIC = Inf,
+       final_fit = list(0),
+       trace = "Trace: \n", #use writeLines()
+       std_resid = list(0),
+       std_resid.mean = 0,
+       std_resid.sd = 0,
+       std_resid.skew = Inf,
+       std_resid.shape = Inf,
+       main_err_dist = "sstd",
+       std_resid_qq = list(0),
+       std_resid_qq_err = list(0),
+       std_resid_qq_weighted_err = list(0)) %>%
+  nest(order = c(ARIMA_p, ARIMA_d, ARIMA_q, GARCH_p, GARCH_q))
+
+library(ExtDist) #For Johnson Su distribution, jsu
+library(SuppDists)
+library(GeneralizedHyperbolic) #For generalised hyperbolic distribution
+ERR_DIST = c("norm", "snorm", "std", "sstd", "ged", "sged", "nig", "ghyp", "jsu")
+
+ERR_DIST_FIT = c(ERR_DIST)
+
+library(WeightedPortTest) #For weighted Ljung-Box test
+
+for (i in ERR_DIST){
+  arima_p = 5
+  arima_q = 5
+  garch_p = 5
+  garch_q = 5
+  err_dist = i
+  
+  model <- fn_fit_arima_garch(data = all_stock,
+                              symbol = "AAPL",
+                              n_verification = N_VERIFICATION,
+                              err_dist = err_dist,
+                              arima_p = arima_p,
+                              arima_q = arima_q,
+                              garch_p = garch_p,
+                              garch_q = garch_q,
+                              external_x = as.matrix(select(all_stock, Tue, Wed, Thu, Fri)))
+  
+  if (is.logical(model)){
+    next
+  }
+  
+  model.residual <- residuals(model, standardize = T)
+  
+  #Check Ljung-Box test for std residuals and squared std residuals,
+  #and ARCH-LM test to check significance of remaining ARCH effects.
+  #If there are significant ARCH effect remaining, move up the ARCH model by 1
+  #Remember, fail to reject H0 does not mean accepting H0. Hence,
+  #if any of the test returns reject H0, then we reject H0.
+  #H0 : No remaining ARCH effect up to lag 1,
+  #H1 : ARCH effect present up to lag 1.
+  #alpha = 0.05
+  #Decision. Reject H0 if p value < alpha
+  model.std.resid.LB = Weighted.Box.test(model.residual,
+                                         lag = 1,
+                                         type = "Ljung-Box",
+                                         sqrd.res = FALSE,
+                                         weighted = TRUE)
+  model.std.resid.LBsq = Weighted.Box.test(model.residual,
+                                         lag = 1,
+                                         type = "Ljung-Box",
+                                         sqrd.res = TRUE,
+                                         weighted = TRUE)
+  model.std.resid.LM = Weighted.LM.test(model.residual,
+                                        h.t = as.vector(coredata(sigma(model)))^2,
+                                        lag = 11,
+                                        weighted = TRUE)
+  
+  
+  
+  #Check external regressors significance using robust standard error. Drop insignificant ones
+  dof = nrow(all_stock) - N_VERIFICATION - length(coef(model)) #<====== CHECK DOF. Not sure if this is right
+  model.coef = tibble(name = names(coef(model)),
+                      value = coef(model),
+                      robust.tval = model@fit$robust.tval) %>%
+    mutate(robust.pval = 2*pt(-abs(robust.tval), df = dof)) %>%
+    mutate(significant = robust.pval < alpha)
+  
+  #Select x regressor
+  
+  model
+}
+
+```
+
+##### OLD CODES
 # Find best ARIMA-GARCH model based on AIC
 Note 16/11/2021 - 
 Sometimes ugarchfit() fails to converge (example is AAPL data) for the best ARIMA lags, but converges for lower ARIMA lags. Maybe need to temporarily store the AIC of all ARIMA model, and walk backward the ARIMA model from best to worse AIC if GARCH fails to converge
@@ -270,6 +533,7 @@ loutput <- foreach(i = 1:length(ticker), .combine = "rbind") %dopar% {
   df_arima_results <- df_arima_results %>%
     arrange(AIC)
   
+  ########################
   #Fit GARCH specification
   #Move down the best AIC table if no solution can be found for all lags
   final.aic <- Inf
